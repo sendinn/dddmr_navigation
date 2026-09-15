@@ -125,6 +125,10 @@ MapOptimization::MapOptimization(std::string name,
   this->get_parameter("mapping.distance_between_key_frame", distance_between_key_frame_);
   RCLCPP_INFO(this->get_logger(), "mapping.distance_between_key_frame: %.2f", distance_between_key_frame_);
 
+  declare_parameter("mapping.use_external_odometry_only", rclcpp::ParameterValue(false));
+  this->get_parameter("mapping.use_external_odometry_only", use_external_odometry_only_);
+  RCLCPP_INFO(this->get_logger(), "mapping.use_external_odometry_only: %d", use_external_odometry_only_);
+
   declare_parameter("mapping.ground_edge_threshold_num", rclcpp::ParameterValue(50));
   this->get_parameter("mapping.ground_edge_threshold_num", ground_edge_threshold_num_);
   RCLCPP_INFO(this->get_logger(), "mapping.ground_edge_threshold_num: %d", ground_edge_threshold_num_);
@@ -1934,7 +1938,15 @@ void MapOptimization::run() {
   
   downsampleCurrentScan();
   
-  scan2MapOptimization();
+  if (use_external_odometry_only_) {
+    // transformAssociateToMap() has already propagated the external odometry
+    // increment into transformTobeMapped. Commit it without scan-to-map
+    // refinement so keyframe selection and pose-graph odometry factors use
+    // the external trajectory. Loop-closure constraints remain available.
+    transformUpdate();
+  } else {
+    scan2MapOptimization();
+  }
 
   saveKeyFramesAndFactor();
 
