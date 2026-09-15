@@ -77,6 +77,19 @@ ImageProjection::ImageProjection(std::string name, Channel<ProjectionOut>& outpu
   declare_parameter("laser.num_horizontal_scans", rclcpp::ParameterValue(0));
   this->get_parameter("laser.num_horizontal_scans", _horizontal_scans);
   RCLCPP_INFO(this->get_logger(), "laser.num_horizontal_scans: %d", _horizontal_scans);
+
+  // Astrall extension: upstream behavior remains unchanged when this parameter
+  // is absent because a full 360-degree FOV is the default.
+  declare_parameter("laser.horizontal_fov", rclcpp::ParameterValue(360.0));
+  this->get_parameter("laser.horizontal_fov", _horizontal_fov);
+  if (_horizontal_fov <= 0.0f || _horizontal_fov > 360.0f) {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "laser.horizontal_fov must be in (0, 360], got %.2f; using 360 degrees.",
+      _horizontal_fov);
+    _horizontal_fov = 360.0f;
+  }
+  RCLCPP_INFO(this->get_logger(), "laser.horizontal_fov: %.2f", _horizontal_fov);
   
   //@get this assign as earliest
   cloud_size_ = _vertical_scans * _horizontal_scans;
@@ -422,8 +435,20 @@ void ImageProjection::cloudHandler(
   }
 
   pc_valid_ = true;
-  if(_laser_cloud_in->points.size()<_vertical_scans*_horizontal_scans*0.1*(stitcher_num_)){
-    RCLCPP_ERROR(this->get_logger(), "Expecting: %d points, but you only got %lu, check your lidar scan.", _vertical_scans*_horizontal_scans, _laser_cloud_in->points.size());
+  // Upstream checked 10% of num_vertical_scans*num_horizontal_scans per stitched
+  // frame, although its old error text printed the full bin count as "Expecting".
+  // A fan lidar only fills its physical FOV, so scale that same 10% check by the
+  // visible fraction while keeping num_horizontal_scans as the full 360° grid.
+  const double visible_bin_count = static_cast<double>(_vertical_scans) *
+    static_cast<double>(_horizontal_scans) * (_horizontal_fov / 360.0);
+  const double minimum_valid_point_count = visible_bin_count * 0.1 * stitcher_num_;
+  if(_laser_cloud_in->points.size() < minimum_valid_point_count){
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "Expecting at least %.0f points for a %.1f-degree horizontal FOV "
+      "(full projection: %d bins), but you only got %lu; check your lidar scan.",
+      minimum_valid_point_count, _horizontal_fov,
+      _vertical_scans * _horizontal_scans, _laser_cloud_in->points.size());
     pc_valid_ = false;
     return;
   }
@@ -1159,5 +1184,3 @@ void ImageProjection::publishClouds() {
   first_frame_processed_++;
 
 }
-
-

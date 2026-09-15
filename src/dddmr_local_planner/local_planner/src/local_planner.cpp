@@ -496,9 +496,33 @@ void Local_Planner::getBestTrajectory(std::string traj_gen_name, base_trajectory
   RCLCPP_WARN(this->get_logger(), "Scoring time: %.9f", diff_t);
   #endif
 
-  //for(auto report_it=rejected_trajectories_.begin(); report_it!=rejected_trajectories_.end(); report_it++){
-  //  RCLCPP_INFO(this->get_logger().get_child(name_), "Report: %s with rate: %.2f", (*report_it).first.c_str(), (float)(*report_it).second.size()/(float)trajectories_->size());
-  //}
+  std::string rejection_report;
+  for (const auto& report : rejected_trajectories_) {
+    if (report.first == "pass" || report.second.empty()) {
+      continue;
+    }
+    if (!rejection_report.empty()) {
+      rejection_report += ", ";
+    }
+    rejection_report += report.first + "=" + std::to_string(report.second.size());
+  }
+
+  if (accepted_trajectories_.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger().get_child(name_), *clock_, 5000,
+      "Trajectory scoring rejected all candidates: generator=%s, total=%zu, "
+      "rejected_by={%s}, perception_points=%zu, prune_plan_points=%zu",
+      traj_gen_name.c_str(), trajectories_->size(), rejection_report.c_str(),
+      perception_3d_ros_->getSharedDataPtr()->aggregate_observation_->size(),
+      pcl_prune_plan_.size());
+  } else {
+    RCLCPP_DEBUG_THROTTLE(
+      this->get_logger().get_child(name_), *clock_, 5000,
+      "Trajectory scoring: generator=%s, total=%zu, accepted=%zu, "
+      "rejected_by={%s}",
+      traj_gen_name.c_str(), trajectories_->size(), accepted_trajectories_.size(),
+      rejection_report.c_str());
+  }
 
   trajectory_generators_ros_->expertScoring(traj_gen_name, accepted_trajectories_, rejected_trajectories_, best_traj);
 

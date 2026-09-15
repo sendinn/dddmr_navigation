@@ -499,15 +499,37 @@ void GlobalPlanner::makePlan(const std::shared_ptr<rclcpp_action::ServerGoalHand
   geometry_msgs::msg::PoseStamped start;
   perception_3d_ros_->getGlobalPose(start);
 
+  RCLCPP_INFO_THROTTLE(
+    this->get_logger(), *clock_, 5000,
+    "Planning request: start=(%.2f, %.2f, %.2f), goal=(%.2f, %.2f, %.2f), "
+    "static_ground_nodes=%zu, graph_ready=%d",
+    start.pose.position.x, start.pose.position.y, start.pose.position.z,
+    goal->goal.pose.position.x, goal->goal.pose.position.y,
+    goal->goal.pose.position.z, pcl_ground_->size(), graph_ready_);
+
   auto ros_path = makeROSPlan(start, goal->goal);
 
   if(ros_path.poses.empty()){
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *clock_, 5000,
+      "Planning result: failed, no path points; start=(%.2f, %.2f, %.2f), "
+      "goal=(%.2f, %.2f, %.2f), graph_ready=%d",
+      start.pose.position.x, start.pose.position.y, start.pose.position.z,
+      goal->goal.pose.position.x, goal->goal.pose.position.y,
+      goal->goal.pose.position.z, graph_ready_);
     global_plan_result_->path = ros_path;
     goal_handle->abort(global_plan_result_);
   }
   else{
     //postSmoothPath(path, smoothed_path);
     pub_path_->publish(ros_path);
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *clock_, 5000,
+      "Planning result: success, path_points=%zu, start=(%.2f, %.2f, %.2f), "
+      "goal=(%.2f, %.2f, %.2f)",
+      ros_path.poses.size(), start.pose.position.x, start.pose.position.y,
+      start.pose.position.z, goal->goal.pose.position.x,
+      goal->goal.pose.position.y, goal->goal.pose.position.z);
     global_plan_result_->path = ros_path;
     goal_handle->succeed(global_plan_result_);
   }
@@ -517,31 +539,41 @@ void GlobalPlanner::makePlan(const std::shared_ptr<rclcpp_action::ServerGoalHand
 nav_msgs::msg::Path GlobalPlanner::makeROSPlan(const geometry_msgs::msg::PoseStamped& start, const geometry_msgs::msg::PoseStamped& goal){
   
   std::unique_lock<std::mutex> lock(protect_kdtree_ground_);
-  unsigned int start_id, goal_id;
+  unsigned int start_id = 0;
+  unsigned int goal_id = 0;
   std::vector<unsigned int> path;
   std::vector<unsigned int> smoothed_path;
   std::vector<unsigned int> smoothed_path_2nd;
   nav_msgs::msg::Path ros_path;
 
-  if(getStartGoalID(start, goal, start_id, goal_id)){
-    if(!use_pre_graph_)
-      a_star_planner_->getPath(start_id, goal_id, path);
-    else
-      a_star_planner_pre_graph_->getPath(start_id, goal_id, path);  
+  if(!getStartGoalID(start, goal, start_id, goal_id)){
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *clock_, 5000,
+      "Cannot resolve start/goal to ground graph: start=(%.2f, %.2f, %.2f), "
+      "goal=(%.2f, %.2f, %.2f), start_tolerance=%.2f, graph_ready=%d",
+      start.pose.position.x, start.pose.position.y, start.pose.position.z,
+      goal.pose.position.x, goal.pose.position.y, goal.pose.position.z,
+      find_start_tolerance_, graph_ready_);
+    return ros_path;
   }
+
+  if(!use_pre_graph_)
+    a_star_planner_->getPath(start_id, goal_id, path);
+  else
+    a_star_planner_pre_graph_->getPath(start_id, goal_id, path);
 
   if(path.empty()){
     if(enable_detail_log_)
-      RCLCPP_WARN(this->get_logger(), "No path found from: %u to %u", start_id, goal_id);
+      RCLCPP_WARN(this->get_logger(), "No path found from node %u to %u; graph nodes=%zu", start_id, goal_id, pcl_ground_->size());
     else
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "No path found from: %u to %u", start_id, goal_id);
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "No path found from node %u to %u; graph nodes=%zu", start_id, goal_id, pcl_ground_->size());
     return ros_path;
   }
   else{
     if(enable_detail_log_)
-      RCLCPP_INFO(this->get_logger(), "Path found from: %u to %u", start_id, goal_id);
+      RCLCPP_INFO(this->get_logger(), "Path found from node %u to %u: graph path nodes=%zu", start_id, goal_id, path.size());
     else
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *clock_, 5000, "Path found from: %u to %u", start_id, goal_id);
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *clock_, 5000, "Path found from node %u to %u: graph path nodes=%zu", start_id, goal_id, path.size());
     getROSPath(path, ros_path);
     ros_path.poses.push_back(goal);
     return ros_path;

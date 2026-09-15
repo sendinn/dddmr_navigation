@@ -91,6 +91,7 @@ class ImageProjection : public rclcpp::Node
     size_t cloud_size_;
     int _vertical_scans;
     int _horizontal_scans;
+    float _horizontal_fov;
     double _scan_period;
     float _ang_bottom;
     float _ang_resolution_X;
