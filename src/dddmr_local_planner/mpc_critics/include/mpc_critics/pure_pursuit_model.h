@@ -44,6 +44,7 @@ class PurePursuitModel: public ScoringModel{
   protected:
 
     virtual void onInitialize();
+    bool planar_tracking_ = false;
 
   private:
     double translation_weight_, orientation_weight_;

@@ -407,6 +407,9 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
   if (num_steps == 0) {
     return false;
   }
+  // Low-speed startup still needs a trajectory, not a single endpoint.
+  // Increasing subdivision preserves the horizon and tightens collision checks.
+  num_steps = std::max(2, num_steps);
 
   //compute a timestep
   double dt = params_->sim_time / num_steps;

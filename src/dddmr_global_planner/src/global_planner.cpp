@@ -104,6 +104,14 @@ void GlobalPlanner::initial(const std::shared_ptr<perception_3d::Perception3D_RO
   declare_parameter("find_start_tolerance", rclcpp::ParameterValue(0.5));
   this->get_parameter("find_start_tolerance", find_start_tolerance_);
   RCLCPP_INFO(this->get_logger(), "find_start_tolerance: %.2f", find_start_tolerance_);    
+  // Zero offset preserves the original spherical search for existing robots.
+  start_ground_offset_ = declare_parameter<double>("start_ground_offset", 0.0);
+  start_ground_z_tolerance_ = declare_parameter<double>("start_ground_z_tolerance", 0.2);
+  if (!std::isfinite(start_ground_offset_) || start_ground_offset_ < 0.0 ||
+      !std::isfinite(start_ground_z_tolerance_) || start_ground_z_tolerance_ <= 0.0 ||
+      !std::isfinite(find_start_tolerance_) || find_start_tolerance_ <= 0.0) {
+    throw std::invalid_argument("Invalid start ground projection parameters");
+  }
 
   
 
@@ -455,10 +463,48 @@ bool GlobalPlanner::getStartGoalID(const geometry_msgs::msg::PoseStamped& start,
   pcl_start.y = start.pose.position.y;
   pcl_start.z = start.pose.position.z;
 
-  if(kdtree_ground_->radiusSearch (pcl_start, find_start_tolerance_, pointIdxRadiusSearch_start, pointRadiusSquaredDistance_start)<1){
-    RCLCPP_WARN(this->get_logger(), "Start is not found.");
+  if (start_ground_offset_ > 0.0) {
+    // Project the body-frame origin onto the expected floor height. Restrict
+    // height separately so a nearby upper/lower floor cannot win on XY alone.
+    pcl_start.z -= start_ground_offset_;
+    kdtree_ground_->radiusSearch(pcl_start,
+        std::hypot(find_start_tolerance_, start_ground_z_tolerance_),
+        pointIdxRadiusSearch_start, pointRadiusSquaredDistance_start);
+    int best_id = -1;
+    double best_xy = find_start_tolerance_ * find_start_tolerance_;
+    double best_dz = start_ground_z_tolerance_;
+    for (const int id : pointIdxRadiusSearch_start) {
+      const auto& point = pcl_ground_->points[id];
+      const double dx = point.x - pcl_start.x;
+      const double dy = point.y - pcl_start.y;
+      const double xy = dx * dx + dy * dy;
+      const double dz = std::abs(point.z - pcl_start.z);
+      if (dz <= start_ground_z_tolerance_ &&
+          (xy < best_xy || (xy == best_xy && dz <= best_dz))) {
+        best_id = id;
+        best_xy = xy;
+        best_dz = dz;
+      }
+    }
+    pointIdxRadiusSearch_start.clear();
+    if (best_id >= 0) pointIdxRadiusSearch_start.push_back(best_id);
+  } else {
+    kdtree_ground_->radiusSearch(pcl_start, find_start_tolerance_,
+        pointIdxRadiusSearch_start, pointRadiusSquaredDistance_start);
+  }
+  if (pointIdxRadiusSearch_start.empty()) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000,
+        "Start ground not found: body=(%.3f, %.3f, %.3f), query_z=%.3f, "
+        "search_tolerance=%.3f, ground_offset=%.3f, z_tolerance=%.3f",
+        start.pose.position.x, start.pose.position.y, start.pose.position.z,
+        pcl_start.z, find_start_tolerance_, start_ground_offset_, start_ground_z_tolerance_);
     return false;
   }
+  const auto& selected_ground = pcl_ground_->points[pointIdxRadiusSearch_start[0]];
+  RCLCPP_INFO_THROTTLE(this->get_logger(), *clock_, 5000,
+      "Start ground projection: horizontal_distance=%.3f, body_height=%.3f, ground_z=%.3f",
+      std::hypot(selected_ground.x - pcl_start.x, selected_ground.y - pcl_start.y),
+      start.pose.position.z - selected_ground.z, selected_ground.z);
   
   if(enable_detail_log_){
     RCLCPP_WARN(this->get_logger(), "Selected start: %.2f, %.2f, %.2f, Nearest-> id: %u, x: %.2f, y: %.2f, z: %.2f", 
@@ -575,6 +621,52 @@ nav_msgs::msg::Path GlobalPlanner::makeROSPlan(const geometry_msgs::msg::PoseSta
     else
       RCLCPP_INFO_THROTTLE(this->get_logger(), *clock_, 5000, "Path found from node %u to %u: graph path nodes=%zu", start_id, goal_id, path.size());
     getROSPath(path, ros_path);
+    if (start_ground_offset_ > 0.0 && !ros_path.poses.empty()) {
+      const auto anchor = ros_path.poses.front();
+      const double dx = anchor.pose.position.x - start.pose.position.x;
+      const double dy = anchor.pose.position.y - start.pose.position.y;
+      const double length = std::hypot(dx, dy);
+      std::vector<geometry_msgs::msg::PoseStamped> connector;
+      const int steps = std::max(1, static_cast<int>(std::ceil(length / 0.05)));
+      for (int i = 0; i < steps; ++i) {
+        auto pose = anchor;
+        const double t = static_cast<double>(i) / steps;
+        pose.pose.position.x = start.pose.position.x + dx * t;
+        pose.pose.position.y = start.pose.position.y + dy * t;
+        pcl::PointXYZI query;
+        query.x = pose.pose.position.x;
+        query.y = pose.pose.position.y;
+        query.z = anchor.pose.position.z;
+        std::vector<int> ids;
+        std::vector<float> distances;
+        if (kdtree_ground_->nearestKSearch(query, 1, ids, distances) < 1 ||
+            distances[0] > 0.25 * 0.25) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *clock_, 5000,
+              "Start connector rejected: insufficient ground support, gap=%.3f m", length);
+          ros_path.poses.clear();
+          return ros_path;
+        }
+        // Conservatively account for distance from the evaluated graph node:
+        // a free node alone does not prove that the offset connector is free.
+        const double support_distance = std::sqrt(distances[0]);
+        const double clearance = perception_3d_ros_->get_min_dGraphValue(ids[0]);
+        if (!std::isfinite(clearance) || clearance <
+            perception_3d_ros_->getGlobalUtils()->getInscribedRadius() + support_distance) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *clock_, 5000,
+              "Start connector rejected: clearance=%.3f, support_distance=%.3f, gap=%.3f m",
+              clearance, support_distance, length);
+          ros_path.poses.clear();
+          return ros_path;
+        }
+        connector.push_back(pose);
+      }
+      if (length > 0.001) {
+        ros_path.poses.insert(ros_path.poses.begin(), connector.begin(), connector.end());
+        RCLCPP_INFO_THROTTLE(get_logger(), *clock_, 5000,
+            "Validated start connector: horizontal_gap=%.3f m, samples=%zu, ground_z=%.3f",
+            length, connector.size(), anchor.pose.position.z);
+      }
+    }
     ros_path.poses.push_back(goal);
     return ros_path;
   }

@@ -477,6 +477,12 @@ void Local_Planner::getBestTrajectory(std::string traj_gen_name, base_trajectory
   //@ TODO make this omp version
   for(auto traj_it=trajectories_->begin();traj_it!=trajectories_->end();traj_it++){
 
+    if (traj_it->getPosesSize() < 2) {
+      traj_it->cost_ = -4.0;
+      traj_it->rejected_by_ = "generation_empty_or_short";
+      rejected_trajectories_[traj_it->rejected_by_].push_back(*traj_it);
+      continue;
+    }
     mpc_critics_ros_->scoreTrajectory(traj_gen_name, (*traj_it));
     
     if((*traj_it).cost_>=0){

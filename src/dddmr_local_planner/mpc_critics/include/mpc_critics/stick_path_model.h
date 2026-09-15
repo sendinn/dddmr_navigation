@@ -43,6 +43,7 @@ class StickPathModel: public ScoringModel{
   protected:
 
     virtual void onInitialize();
+    bool planar_tracking_ = false;
 };
 
 }//end of name space

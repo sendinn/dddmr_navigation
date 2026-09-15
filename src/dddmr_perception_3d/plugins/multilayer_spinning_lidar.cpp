@@ -224,10 +224,10 @@ void MultiLayerSpinningLidar::cbSensor(const sensor_msgs::msg::PointCloud2::Shar
   rclcpp::Duration diff = time2 - time1;
   double seconds_between_expectation = fabs(diff.seconds() - expected_sensor_time_);
   last_sensor_receiving_time_ = msg->header;
-  if(seconds_between_expectation>0.05 && diff.seconds()>expected_sensor_time_){
+  if(time1.nanoseconds() != 0 && seconds_between_expectation>0.05 && diff.seconds()>expected_sensor_time_){
     RCLCPP_WARN_THROTTLE(node_->get_logger().get_child(name_), 
-        *clock_, 1000, "Topic: %s received with lantency higher than your expection: %.3f seconds difference and your are expecting: %.3f", 
-          topic_.c_str(), diff.seconds(), expected_sensor_time_);
+        *clock_, 1000, "Sensor frame gap: topic=%s, stamp_interval=%.3f s, message_age=%.3f s, timeout=%.3f s",
+          topic_.c_str(), diff.seconds(), (clock_->now() - time2).seconds(), expected_sensor_time_);
   }
 
   //@if not stitch, save copy time
@@ -1034,9 +1034,12 @@ double MultiLayerSpinningLidar::get_dGraphValue(const unsigned int index){
 bool MultiLayerSpinningLidar::isCurrent(){
   
   auto time_diff = (clock_->now() - last_observation_time_).seconds();
-  if(time_diff > expected_sensor_time_)
+  if(time_diff > expected_sensor_time_) {
     current_ = false;
-  else
+    RCLCPP_WARN_THROTTLE(node_->get_logger().get_child(name_), *clock_, 5000,
+        "Perception stale: topic=%s, since_last_processed=%.3f s, timeout=%.3f s",
+        topic_.c_str(), time_diff, expected_sensor_time_);
+  } else
     current_ = true;
 
   return current_;

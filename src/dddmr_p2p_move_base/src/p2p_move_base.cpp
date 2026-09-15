@@ -37,6 +37,9 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
 {
   name_ = name;
   clock_ = this->get_clock();
+  enable_rotate_recovery_ = declare_parameter<bool>("enable_rotate_recovery", true);
+  RCLCPP_INFO(get_logger(), "enable_rotate_recovery: %s",
+      enable_rotate_recovery_ ? "true" : "false");
 }
 
 rclcpp_action::GoalResponse P2PMoveBase::handle_goal(
@@ -181,6 +184,12 @@ void P2PMoveBase::publishZeroVelocity(){
 }
 
 void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
+  if (!progress_control_started_) {
+    progress_control_started_ = true;
+    STATE_->last_oscillation_reset_ = clock_->now();
+    STATE_->oscillation_pose_ = LP_->getGlobalPose();
+    RCLCPP_INFO(get_logger(), "Progress watchdog starts with first control command (not goal submission).");
+  }
 
   if(cmd_traj.actuator_type_ == dddmr_sys_core::ActuatorType::MOTOR){
     geometry_msgs::msg::Twist cmd_vel;
@@ -229,6 +238,7 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
   //@ if we dont initialize oscillation pose here, the first controlling entry will cause recovery behavior.
   //@ the rclcpp::Time initial are all done in FSM class
   STATE_->initialParams(LP_->getGlobalPose(), clock_->now());
+  progress_control_started_ = false;
   STATE_->current_goal_ = move_base_goal->target_pose;
   GPM_->setGoal(STATE_->current_goal_);
   GPM_->resume();
@@ -290,7 +300,11 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
     STATE_->global_pose_ = LP_->getGlobalPose();
     LP_->syncRobotState(robot_state_, ackermann_drive_state_);
 
-    if(STATE_->getDistance(STATE_->global_pose_, STATE_->oscillation_pose_) >= STATE_->oscillation_distance_ ||
+    // Gait-related vertical bobbing is not forward progress on the floor.
+    const double progress_xy = std::hypot(
+        STATE_->global_pose_.transform.translation.x - STATE_->oscillation_pose_.transform.translation.x,
+        STATE_->global_pose_.transform.translation.y - STATE_->oscillation_pose_.transform.translation.y);
+    if(progress_xy >= STATE_->oscillation_distance_ ||
           STATE_->getAngle(STATE_->global_pose_, STATE_->oscillation_pose_) >= STATE_->oscillation_angle_)
     {
       STATE_->oscillation_pose_ = STATE_->global_pose_;
@@ -622,6 +636,13 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
     }
 
     else if(STATE_->isCurrentDecision("d_recovery_waitdone")){
+      if (!enable_rotate_recovery_) {
+        RCLCPP_ERROR(get_logger(), "Rotate recovery disabled: aborting navigation after planner/controller failure.");
+        publishZeroVelocity();
+        auto result = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>();
+        goal_handle->abort(result);
+        return true;
+      }
       
       if(is_recoverying_){
         return false;
@@ -736,6 +757,13 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 }
 
 void P2PMoveBase::startRecoveryBehaviors(std::string behavior_name){
+  if (behavior_name == "rotate_inplace" && !enable_rotate_recovery_) {
+    publishZeroVelocity();
+    is_recoverying_ = false;
+    is_recoverying_succeed_ = false;
+    RCLCPP_WARN(get_logger(), "Rotate recovery request suppressed by enable_rotate_recovery=false.");
+    return;
+  }
 
   auto goal_msg = dddmr_sys_core::action::RecoveryBehaviors::Goal();
   goal_msg.behavior_name = behavior_name;

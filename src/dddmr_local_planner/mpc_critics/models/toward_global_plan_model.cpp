@@ -42,6 +42,7 @@ TowardGlobalPlanModel::TowardGlobalPlanModel(){
 
 void TowardGlobalPlanModel::onInitialize(){
 
+  planar_tracking_ = node_->declare_parameter<bool>(name_ + ".planar_tracking", false);
   node_->declare_parameter(name_ + ".weight", rclcpp::ParameterValue(1.0));
   node_->get_parameter(name_ + ".weight", weight_);
   RCLCPP_INFO(node_->get_logger().get_child(name_), "weight: %.2f", weight_);
@@ -60,11 +61,14 @@ double TowardGlobalPlanModel::scoreTrajectory(base_trajectory::Trajectory &traj)
   geometry_msgs::msg::PoseStamped last_traj_pose = traj.getPose(traj.getPosesSize()-1);
 
   pcl::KdTreeFLANN<pcl::PointXYZI> prune_plan_kdtree;
-  prune_plan_kdtree.setInputCloud(shared_data_->pcl_prune_plan_);
+  auto tracking_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(*shared_data_->pcl_prune_plan_);
+  if (planar_tracking_) for (auto& point : tracking_cloud->points) point.z = 0.0;
+  prune_plan_kdtree.setInputCloud(tracking_cloud);
   int K = 1;
   
   //@ get last traj pose
   pcl::PointXYZI pcl_traj_pose = traj.getPCLPoint(traj.getPosesSize()-1);
+  if (planar_tracking_) pcl_traj_pose.z = 0.0;
   std::vector<int> pointIdxNKNSearch(K);
   std::vector<float> pointNKNSquaredDistance(K);
   if ( prune_plan_kdtree.nearestKSearch (pcl_traj_pose, K, pointIdxNKNSearch, pointNKNSquaredDistance) > 0 ){

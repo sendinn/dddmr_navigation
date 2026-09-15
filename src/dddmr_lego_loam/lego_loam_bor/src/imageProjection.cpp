@@ -749,8 +749,9 @@ void ImageProjection::zPitchRollFeatureRemoval() {
 
       float vertical_angle = std::atan2(dZ , sqrt(dX * dX + dY * dY));
 
-      // zPitchRoll feature
-      if ( vertical_angle <= 5 * DEG_TO_RAD) {
+      // zPitchRoll feature.  Ground must be nearly horizontal in either
+      // direction; without abs(), every steep negative surface is accepted.
+      if (fabs(vertical_angle) <= 5 * DEG_TO_RAD) {
         _ground_mat(i, j) = 1;
         _ground_mat(i + 1, j) = 1;
         _z_pitch_roll_decisive_feature_cloud->push_back(_full_cloud->points[upperInd]);
@@ -906,7 +907,11 @@ void ImageProjection::zPitchRollFeatureRemoval() {
         float dZg = upperInd_pt_no_pitch.z - lowerInd_pt_no_pitch.z;
 
         float vertical_angle = std::atan2(dZg , sqrt(dXg * dXg + dYg * dYg));
-        if ( fabs(vertical_angle) > ground_slope_tolerance_ && fabs(dZg)>ground_dz_tolerance_) {
+        // Slope and height difference are independent safety limits.  Using
+        // AND here lets densely sampled vertical walls through whenever two
+        // adjacent scan rows happen to have a small height difference.
+        if (fabs(vertical_angle) > ground_slope_tolerance_ ||
+            fabs(dZg) > ground_dz_tolerance_) {
           do_patch = false;
           _segmented_cloud_pure->push_back(_full_cloud->points[lowerInd]);
           continue;

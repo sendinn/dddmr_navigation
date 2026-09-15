@@ -42,6 +42,7 @@ PurePursuitModel::PurePursuitModel(){
 
 void PurePursuitModel::onInitialize(){
 
+  planar_tracking_ = node_->declare_parameter<bool>(name_ + ".planar_tracking", false);
   node_->declare_parameter(name_ + ".weight", rclcpp::ParameterValue(1.0));
   node_->get_parameter(name_ + ".weight", weight_);
   RCLCPP_INFO(node_->get_logger().get_child(name_), "weight: %.2f", weight_);
@@ -98,7 +99,7 @@ double PurePursuitModel::scoreTrajectory(base_trajectory::Trajectory &traj){
   tf2::convert(tf_pose_difference.transform.rotation , q);
   tf2::Matrix3x3(q).getEulerYPR(y,p,r);
 
-  y = std::fmod((y+3.1416),3.1416);
+  y = std::abs(std::atan2(std::sin(y), std::cos(y)));
   //RCLCPP_DEBUG(node_->get_logger().get_child(name_), "yaw: %f",y);
   double distance = sqrt(tf_pose_difference.transform.translation.x*tf_pose_difference.transform.translation.x+
                         tf_pose_difference.transform.translation.y*tf_pose_difference.transform.translation.y+
@@ -110,7 +111,11 @@ double PurePursuitModel::scoreTrajectory(base_trajectory::Trajectory &traj){
   */
   //RCLCPP_INFO(node_->get_logger().get_child(name_), "trans: %f,%f,%f", tf_pose_difference.transform.translation.x, tf_pose_difference.transform.translation.y, tf_pose_difference.transform.translation.z);
   //@ normalized translation vs rotation
-  return (translation_weight_*distance + orientation_weight_*y);
+  if (planar_tracking_) {
+    distance = std::hypot(last_traj_pose.pose.position.x - last_prune_plan_pose.pose.position.x,
+                          last_traj_pose.pose.position.y - last_prune_plan_pose.pose.position.y);
+  }
+  return weight_ * (translation_weight_*distance + orientation_weight_*y);
 }
 
 }//end of name space

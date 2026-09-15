@@ -42,6 +42,7 @@ StickPathModel::StickPathModel(){
 
 void StickPathModel::onInitialize(){
 
+  planar_tracking_ = node_->declare_parameter<bool>(name_ + ".planar_tracking", false);
   node_->declare_parameter(name_ + ".weight", rclcpp::ParameterValue(1.0));
   node_->get_parameter(name_ + ".weight", weight_);
   RCLCPP_INFO(node_->get_logger().get_child(name_), "weight: %.2f", weight_);
@@ -56,12 +57,16 @@ double StickPathModel::scoreTrajectory(base_trajectory::Trajectory &traj){
     return 10.0;
   }
   pcl::KdTreeFLANN<pcl::PointXYZI> prune_plan_kdtree;
-  prune_plan_kdtree.setInputCloud(shared_data_->pcl_prune_plan_);
+  auto tracking_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(*shared_data_->pcl_prune_plan_);
+  if (planar_tracking_) for (auto& point : tracking_cloud->points) point.z = 0.0;
+  prune_plan_kdtree.setInputCloud(tracking_cloud);
+  if (traj.getPosesSize() == 0) return -4.0;
   int K = 1;
   double normalized_distance = 0.0;
   for(unsigned int i=0;i<traj.getPosesSize();i++){
 
     pcl::PointXYZI pcl_traj_pose = traj.getPCLPoint(i);
+    if (planar_tracking_) pcl_traj_pose.z = 0.0;
     std::vector<int> pointIdxNKNSearch(K);
     std::vector<float> pointNKNSquaredDistance(K);
     if ( prune_plan_kdtree.nearestKSearch (pcl_traj_pose, K, pointIdxNKNSearch, pointNKNSquaredDistance) > 0 ){
@@ -71,7 +76,7 @@ double StickPathModel::scoreTrajectory(base_trajectory::Trajectory &traj){
       normalized_distance += 3.0;
     }
   }
-  normalized_distance /= shared_data_->pcl_prune_plan_->points.size();
+  normalized_distance /= traj.getPosesSize();
   //RCLCPP_INFO(this->get_logger(), "Normalized_distance: %f",normalized_distance);
   return normalized_distance * weight_;
 }
