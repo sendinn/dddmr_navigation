@@ -192,28 +192,34 @@ LidarMeasurementResult LidarMeasurementModelLikelihood::measure(
   }
 
   size_t num = 0;
+  const size_t total =
+      pc_flat_new_type->points.size() + pc_less_sharp_new_type->points.size();
   std::vector<int> id(1);
   std::vector<float> sqdist(1);
 
   for (auto& p : pc_flat_new_type->points)
   {
     if(is_ground_health){
-      //kdtree_ground.radiusSearch(p, match_dist_min_, id, sqdist, 1);
+      id.clear();
+      sqdist.clear();
       kdtree_ground.nearestKSearch(p, 1, id, sqdist);
     }
     else{
-      //kdtree.radiusSearch(p, match_dist_min_, id, sqdist, 1);
-      kdtree_ground.nearestKSearch(p, 1, id, sqdist);
+      id.clear();
+      sqdist.clear();
+      kdtree.nearestKSearch(p, 1, id, sqdist);
     }
 
-    if (sqdist.size()>0)
+    if (!sqdist.empty())
     {
-      float dist = match_dist_min_ - std::sqrt(sqdist[0]);
+      const float nearest_dist = std::sqrt(sqdist[0]);
+      float dist = match_dist_min_ - nearest_dist;
       if (dist < 0.0)
         dist = 0.001;
 
       score_like += dist * dist;
-      num++;
+      if (nearest_dist <= match_dist_min_)
+        num++;
     }
   }
   /*
@@ -238,17 +244,23 @@ LidarMeasurementResult LidarMeasurementModelLikelihood::measure(
   {
     float pt_segmentation_weight = p.intensity;
 
-    //kdtree.radiusSearch(p, match_dist_min_, id, sqdist, 1)
-    kdtree.nearestKSearch(p, 1, id, sqdist);
-    float dist = match_dist_min_ - std::sqrt(sqdist[0]);
+    id.clear();
+    sqdist.clear();
+    if (kdtree.nearestKSearch(p, 1, id, sqdist) <= 0 || sqdist.empty())
+      continue;
+
+    const float nearest_dist = std::sqrt(sqdist[0]);
+    float dist = match_dist_min_ - nearest_dist;
     if (dist < 0.0)
       dist = 0.001;
 
     score_like += dist * dist / pt_segmentation_weight;
-    num++;
+    if (nearest_dist <= match_dist_min_)
+      num++;
     
   }
-  const float match_ratio = static_cast<float>(num) / (pc_flat_new_type->points.size() + pc_less_sharp_new_type->points.size());
+  const float match_ratio =
+      total == 0 ? 0.0f : static_cast<float>(num) / static_cast<float>(total);
 
   return LidarMeasurementResult(score_like*pos_weight, match_ratio);
 }

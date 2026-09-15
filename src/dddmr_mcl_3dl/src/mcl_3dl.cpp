@@ -506,6 +506,25 @@ void MCL3dlNode::measure(std::map<std::string, pcl::PointCloud<mcl_3dl::pcl_t>::
   //@ pf_->measure(measure_func) will loop particles
   pf_->measure(measure_func);
 
+  // A low match ratio means that even the best particle does not have enough
+  // scan features close to the map.  Do not publish a confident-looking pose
+  // from a tightly clustered but incorrect initial distribution.
+  if (match_ratio_max < params_->match_ratio_thresh_)
+  {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *clock_, 3000,
+        "Localization measurement rejected: best match ratio %.3f is below %.3f",
+        match_ratio_max, params_->match_ratio_thresh_);
+    pf_->noise(State6DOF(
+        Vec3(params_->expansion_var_x_,
+              params_->expansion_var_y_,
+              params_->expansion_var_z_),
+        Vec3(params_->expansion_var_roll_,
+              params_->expansion_var_pitch_,
+              params_->expansion_var_yaw_)));
+    return;
+  }
+
   //@ This block first calculate the weight (p.probability_bias_) based on the particle state
   //@ It means that the particle away from last pose has less weight
   //@ This weight is different from the weight of likelihood
@@ -651,18 +670,6 @@ void MCL3dlNode::measure(std::map<std::string, pcl::PointCloud<mcl_3dl::pcl_t>::
             e.pos_.y_,
             e.pos_.z_);
 
-  if (match_ratio_max < params_->match_ratio_thresh_)
-  {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 3000, "Low match_ratio. Expansion resetting.");
-    pf_->noise(State6DOF(
-        Vec3(params_->expansion_var_x_,
-              params_->expansion_var_y_,
-              params_->expansion_var_z_),
-        Vec3(params_->expansion_var_roll_,
-              params_->expansion_var_pitch_,
-              params_->expansion_var_yaw_)));
-  }
-
   if (static_cast<int>(pf_->getParticleSize()) > params_->num_particles_)
   {
     const int reduced = pf_->getParticleSize() * 0.75;
@@ -790,6 +797,7 @@ void MCL3dlNode::cbPosition(const geometry_msgs::msg::PoseWithCovarianceStamped:
   pf_->predict(integ_reset_func);
 
   publishParticles();
+  tf_ready_ = false;
   first_tf_ = false;
 }
 
