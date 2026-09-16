@@ -154,6 +154,7 @@ class ImageProjection : public rclcpp::Node
     double sensor_install_pitch_;
     double ground_slope_tolerance_, ground_dz_tolerance_;
     bool ground_normal_check_;
+    int ground_processing_threads_ = 4;
     double ground_normal_radius_;
     int ground_normal_min_neighbors_;
     

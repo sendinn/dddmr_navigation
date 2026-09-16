@@ -40,6 +40,8 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
   localization_timeout_ = declare_parameter<double>("localization_timeout", 0.0);
   const double xy_limit = declare_parameter<double>("localization_xy_std_max", 0.15);
   const double yaw_limit = declare_parameter<double>("localization_yaw_std_max", 0.20);
+  localization_xy_limit_ = xy_limit;
+  localization_yaw_limit_ = yaw_limit;
   if (!std::isfinite(localization_timeout_) || localization_timeout_ < 0.0 ||
       !std::isfinite(xy_limit) || xy_limit <= 0.0 || !std::isfinite(yaw_limit) || yaw_limit <= 0.0)
     throw std::invalid_argument("Invalid localization safety thresholds");
@@ -47,7 +49,12 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
     localization_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       "mcl_pose", rclcpp::QoS(1).best_effort(),
       [this, xy_limit, yaw_limit](geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg) {
+        std::lock_guard<std::mutex> guard(localization_diagnostics_mutex_);
         const auto& c = msg->pose.covariance;
+        localization_stamp_ns_ = rclcpp::Time(msg->header.stamp).nanoseconds();
+        localization_cov_x_ = c[0];
+        localization_cov_y_ = c[7];
+        localization_cov_yaw_ = c[35];
         const double age = (clock_->now() - rclcpp::Time(msg->header.stamp)).seconds();
         const bool valid = std::isfinite(c[0]) && c[0] >= 0 && c[0] <= xy_limit * xy_limit &&
           std::isfinite(c[7]) && c[7] >= 0 && c[7] <= xy_limit * xy_limit &&
@@ -321,7 +328,23 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
 bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHandle<dddmr_sys_core::action::PToPMoveBase>> goal_handle){
     const auto steady_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (localization_timeout_ > 0.0 && steady_now >= localization_valid_until_.load()) {
+    bool localization_invalid = false;
+    if (localization_timeout_ > 0.0) {
+      std::lock_guard<std::mutex> guard(localization_diagnostics_mutex_);
+      localization_invalid = steady_now >= localization_valid_until_.load();
+      if (localization_invalid) {
+        const double age = localization_stamp_ns_ > 0 ?
+          (clock_->now().nanoseconds() - localization_stamp_ns_) * 1e-9 : -1.0;
+        RCLCPP_ERROR(get_logger(),
+          "Localization gate details: received=%d, age=%.3f s, timeout=%.3f s, "
+          "cov_x=%.6f, cov_y=%.6f, xy_variance_limit=%.6f, "
+          "cov_yaw=%.6f, yaw_variance_limit=%.6f",
+          localization_stamp_ns_ > 0, age, localization_timeout_,
+          localization_cov_x_, localization_cov_y_, localization_xy_limit_ * localization_xy_limit_,
+          localization_cov_yaw_, localization_yaw_limit_ * localization_yaw_limit_);
+      }
+    }
+    if (localization_invalid) {
       publishZeroVelocity();
       recovery_behaviors_client_ptr_->async_cancel_all_goals();
       RCLCPP_ERROR(get_logger(), "Localization absent, stale or uncertain: aborting navigation; a new goal is required.");

@@ -217,6 +217,10 @@ ImageProjection::ImageProjection(std::string name, Channel<ProjectionOut>& outpu
   declare_parameter("imageProjection.ground_dz_tolerance", rclcpp::ParameterValue(0.1));
   this->get_parameter("imageProjection.ground_dz_tolerance", ground_dz_tolerance_);
   ground_normal_check_ = declare_parameter<bool>("imageProjection.ground_normal_check", false);
+  ground_processing_threads_ = declare_parameter<int>("imageProjection.ground_processing_threads", 4);
+  if (ground_processing_threads_ < 1 || ground_processing_threads_ > 16)
+    throw std::invalid_argument("ground_processing_threads must be between 1 and 16");
+  RCLCPP_INFO(get_logger(), "imageProjection.ground_processing_threads: %d", ground_processing_threads_);
   project_walls_to_ground_ = declare_parameter<bool>("imageProjection.project_walls_to_ground", false);
   if (project_walls_to_ground_)
     RCLCPP_WARN(get_logger(), "Experimental wall projection adds inferred ground to saved maps; validate before navigation");
@@ -782,7 +786,7 @@ void ImageProjection::zPitchRollFeatureRemoval() {
     pcl::PointCloud<PointType> features, ground, edges, obstacles, labelled;
   };
   std::vector<ColumnClouds> columns(_horizontal_scans);
-  #pragma omp parallel for num_threads(4) schedule(dynamic, 4)
+  #pragma omp parallel for num_threads(ground_processing_threads_) schedule(dynamic, 4)
   for (size_t j = 0; j < _horizontal_scans; ++j) {
     auto* _z_pitch_roll_decisive_feature_cloud = &columns[j].features;
     auto* patched_ground_ = &columns[j].ground;

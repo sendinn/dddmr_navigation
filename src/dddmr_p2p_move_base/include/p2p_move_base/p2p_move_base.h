@@ -31,6 +31,7 @@
 /*Debug*/
 #include <chrono>
 #include <atomic>
+#include <mutex>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <p2p_move_base/p2p_state.h>
 
@@ -116,6 +117,10 @@ class P2PMoveBase : public rclcpp::Node {
     bool enable_rotate_recovery_ = true;
     double localization_timeout_ = 0.0;
     std::atomic<int64_t> localization_valid_until_{0};
+    std::mutex localization_diagnostics_mutex_;
+    int64_t localization_stamp_ns_ = 0;
+    double localization_cov_x_ = 0.0, localization_cov_y_ = 0.0, localization_cov_yaw_ = 0.0;
+    double localization_xy_limit_ = 0.0, localization_yaw_limit_ = 0.0;
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr localization_sub_;
     bool stop_after_heading_alignment_ = false;
     unsigned heading_stopped_samples_ = 0;
