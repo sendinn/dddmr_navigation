@@ -141,6 +141,11 @@ class MCL3dlNode : public rclcpp::Node
     std::shared_ptr<message_filters::Synchronizer<LegoSyncPolicy>> syncApproximate_;
 
   private:
+    // Caller holds protect_measure_in_odomcb_; both input callbacks may update.
+    void updateFromLatestFeatures();
+    bool planar_mode_ = false;
+    double planar_z_ = 0.0;
+    void constrainPlanarParticles();
 
     bool is_trans_b2s_initialized_;
     bool tf_ready_;
@@ -224,6 +229,8 @@ class MCL3dlNode : public rclcpp::Node
 
     rclcpp::Time match_output_last_;
     rclcpp::Time odom_last_;
+    double stationary_update_interval_ = 0.0;
+    int64_t last_measurement_scan_ns_ = 0;
     bool has_odom_;
     std_msgs::msg::Header laser_header_;
     std_msgs::msg::Header odom_header_;

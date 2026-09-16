@@ -31,6 +31,7 @@
 #include "wall_ground_projection.h"
 #include <Eigen/Eigenvalues>
 #include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/common/centroid.h>
 
 using std::placeholders::_1;
 
@@ -478,12 +479,28 @@ void ImageProjection::cloudHandler(
 
 
   findStartEndAngle();
+  const auto projection_begin = std::chrono::steady_clock::now();
   // Range image projection
   projectPointCloud();
+  const auto ground_begin = std::chrono::steady_clock::now();
   // Mark ground points
   zPitchRollFeatureRemoval();
+  const auto segmentation_begin = std::chrono::steady_clock::now();
   // Point cloud segmentation
   cloudSegmentation();
+  // Unobserved projection bins may be appended as NaNs. They carry no
+  // obstacle evidence; remove them before transport to perception/WebUI.
+  _segmented_cloud_pure->is_dense = false;
+  pcl::removeNaNFromPointCloud(*_segmented_cloud_pure, *_segmented_cloud_pure, indices);
+  const auto segmentation_end = std::chrono::steady_clock::now();
+  const auto seconds = [](auto start, auto end) {
+    return std::chrono::duration<double>(end - start).count();
+  };
+  if (seconds(projection_begin, segmentation_end) > 0.2)
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        "Slow projection pipeline: projection=%.3f s, ground=%.3f s, segmentation=%.3f s, input=%zu",
+        seconds(projection_begin, ground_begin), seconds(ground_begin, segmentation_begin),
+        seconds(segmentation_begin, segmentation_end), _laser_cloud_in->size());
   //publish (optionally)
   publishClouds();
 }
@@ -704,7 +721,9 @@ void ImageProjection::zPitchRollFeatureRemoval() {
   // projection bins on a wall can have the same height. Validate a 3-D plane
   // around BOTH endpoints before classifying or interpolating ground.
   pcl::PointCloud<PointType>::Ptr normal_support(new pcl::PointCloud<PointType>);
-  pcl::KdTreeFLANN<PointType> normal_tree;
+  // Plane fitting uses the whole radius neighborhood and its minimum distance;
+  // sorting every neighbor by distance adds work without changing that set.
+  pcl::KdTreeFLANN<PointType> normal_tree(false);
   std::vector<int> normal_valid(_full_cloud_no_pitch.size(), -1);
   if (ground_normal_check_) {
     pcl::PointCloud<PointType> raw_horizontal;
@@ -719,19 +738,19 @@ void ImageProjection::zPitchRollFeatureRemoval() {
   const auto valid_ground_at = [&](const PointType& point) {
     if (!ground_normal_check_) return true;
     if (normal_support->empty()) return false;
-    std::vector<int> indices; std::vector<float> distances;
+    // Each OpenMP worker reuses its search buffers across neighborhoods.
+    thread_local std::vector<int> indices;
+    thread_local std::vector<float> distances;
     normal_tree.radiusSearch(point, ground_normal_radius_, indices, distances);
     if (indices.size() < static_cast<size_t>(ground_normal_min_neighbors_)) return false;
     // No fabricated floor through an unobserved gap (patch spacing is 0.1 m).
     if (*std::min_element(distances.begin(), distances.end()) > 0.01f) return false;
-    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-    for (int id : indices) mean += normal_support->points[id].getVector3fMap().cast<double>();
-    mean /= indices.size();
-    Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
-    for (int id : indices) {
-      const Eigen::Vector3d d = normal_support->points[id].getVector3fMap().cast<double>() - mean;
-      covariance += d * d.transpose();
-    }
+    // PCL accumulates shifted moments in one pass. Keep double precision and
+    // the original unnormalized covariance/thresholds; no neighbors are dropped.
+    Eigen::Vector4d centroid;
+    Eigen::Matrix3d covariance;
+    pcl::computeMeanAndCovarianceMatrix(*normal_support, indices, covariance, centroid);
+    covariance *= static_cast<double>(indices.size());
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
     if (solver.info() != Eigen::Success) return false;
     const auto values = solver.eigenvalues();
@@ -757,7 +776,19 @@ void ImageProjection::zPitchRollFeatureRemoval() {
   patched_ground_->points.clear();
   patched_ground_edge_->points.clear();
 
+  // Columns write disjoint image cells and normal-cache entries. Keep their
+  // clouds separate, then merge in column order to preserve serial output.
+  struct ColumnClouds {
+    pcl::PointCloud<PointType> features, ground, edges, obstacles, labelled;
+  };
+  std::vector<ColumnClouds> columns(_horizontal_scans);
+  #pragma omp parallel for num_threads(4) schedule(dynamic, 4)
   for (size_t j = 0; j < _horizontal_scans; ++j) {
+    auto* _z_pitch_roll_decisive_feature_cloud = &columns[j].features;
+    auto* patched_ground_ = &columns[j].ground;
+    auto* patched_ground_edge_ = &columns[j].edges;
+    auto* _segmented_cloud_pure = &columns[j].obstacles;
+    auto* yolo_labelled_point_cloud_ = &columns[j].labelled;
     size_t ring_edge = 0;
     size_t closest_ring_edge = _vertical_scans-1;
     bool do_patch = false;
@@ -952,7 +983,8 @@ void ImageProjection::zPitchRollFeatureRemoval() {
             support_point.x = lowerInd_pt_no_pitch.x + dXg*t;
             support_point.y = lowerInd_pt_no_pitch.y + dYg*t;
             support_point.z = lowerInd_pt_no_pitch.z + dZg*t;
-            if (valid_ground_at(support_point)) patched_ground_->push_back(a_pt);
+            // t=0 is the exact lower endpoint, already validated above.
+            if (t == 0.0f || valid_ground_at(support_point)) patched_ground_->push_back(a_pt);
           }
           PointType a_pt;
           a_pt.intensity = 0.0;
@@ -998,6 +1030,14 @@ void ImageProjection::zPitchRollFeatureRemoval() {
       a_ptf.z = a_pt.z;
       patched_ground_->push_back(a_ptf);
     }
+  }
+
+  for (const auto& column : columns) {
+    *_z_pitch_roll_decisive_feature_cloud += column.features;
+    *patched_ground_ += column.ground;
+    *patched_ground_edge_ += column.edges;
+    *_segmented_cloud_pure += column.obstacles;
+    *yolo_labelled_point_cloud_ += column.labelled;
   }
 
   if (project_walls_to_ground_) {

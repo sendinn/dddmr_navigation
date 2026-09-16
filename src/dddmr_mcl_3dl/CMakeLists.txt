@@ -187,6 +187,14 @@ endif()
 
 # --- Everything CI/CD test finish here ---
 
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(planar_constraint_test test/planar_constraint_test.cpp)
+  target_compile_options(planar_constraint_test PRIVATE -UNDEBUG)
+  target_link_libraries(planar_constraint_test ${PCL_LIBRARIES})
+  add_test(NAME planar_constraint_test COMMAND planar_constraint_test)
+endif()
+
 ament_export_include_directories(include)
 ament_export_dependencies(${dependencies})
 ament_package()

@@ -29,6 +29,7 @@
 * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #include <perception_3d/static_layer.h>
+#include <perception_3d/static_support.h>
 #include <stdexcept>
 
 PLUGINLIB_EXPORT_CLASS(perception_3d::StaticLayer, perception_3d::Sensor)
@@ -94,6 +95,12 @@ void StaticLayer::onInitialize()
   node_->get_parameter(name_ + ".static_ground_min_neighbors", static_ground_min_neighbors_);
   node_->declare_parameter(name_ + ".static_imposing_radius", rclcpp::ParameterValue(0.25));
   node_->get_parameter(name_ + ".static_imposing_radius", static_imposing_radius_);
+  static_support_check_ = node_->declare_parameter<bool>(name_ + ".static_support_check", false);
+  static_support_radius_ = node_->declare_parameter<double>(name_ + ".static_support_radius", 0.1);
+  static_support_min_points_ = node_->declare_parameter<int>(name_ + ".static_support_min_points", 2);
+  if (!std::isfinite(static_support_radius_) || static_support_radius_ <= 0 ||
+      static_support_min_points_ < 1)
+    throw std::invalid_argument("Invalid static support cylinder parameters");
   if (!std::isfinite(static_imposing_radius_) || static_imposing_radius_ <= 0 ||
       !std::isfinite(static_obstacle_min_height_) || static_obstacle_min_height_ < 0 ||
       !std::isfinite(static_obstacle_max_height_) ||
@@ -265,6 +272,8 @@ void StaticLayer::selfClear(){
       }
     }
 
+    if (static_support_check_ && !is_local_planner_ && !mapping_mode_)
+      validateStaticSupport();
     shared_data_->is_static_layer_ready_ = true;
     is_ground_and_map_being_initialized_once_ = true;
   }
@@ -273,6 +282,40 @@ void StaticLayer::selfClear(){
       shared_data_->is_static_layer_ready_ = false;
   }
 
+}
+
+void StaticLayer::validateStaticSupport() {
+  // Only withdraw this plugin's contribution; never modify fused/dynamic costs
+  // or remove ground nodes. Missing input is not evidence of free space.
+  if (pcl_map_->empty() || pcl_ground_->empty()) return;
+  size_t checked = 0, cleared = 0;
+  const double search_radius = std::hypot(static_support_radius_, static_obstacle_max_height_) + 1e-6;
+  for (size_t i = 0; i < pcl_ground_->size(); ++i) {
+    const double value = dGraph_.getValue(i);
+    if (!(value < gbl_utils_->getInscribedRadius())) continue;
+    ++checked;
+    const auto& ground = pcl_ground_->points[i];
+    std::vector<int> ids; std::vector<float> distances;
+    shared_data_->kdtree_map_->radiusSearch(ground, search_radius, ids, distances);
+    int count = 0;
+    for (const int id : ids) {
+      const auto& point = pcl_map_->points[id];
+      if (inStaticSupportCylinder(double(point.x)-ground.x, double(point.y)-ground.y,
+                                  double(point.z)-ground.z, static_support_radius_,
+                                  static_obstacle_min_height_, static_obstacle_max_height_)) {
+        if (++count >= static_support_min_points_) break;
+      }
+    }
+    if (rejectStaticSupport(value, gbl_utils_->getInscribedRadius(), count, static_support_min_points_)) {
+      // setValue keeps the minimum and cannot undo a static mark.
+      dGraph_.clearValue(i, gbl_utils_->getMaxObstacleDistance());
+      ++cleared;
+    }
+  }
+  RCLCPP_WARN(node_->get_logger().get_child(name_),
+      "Static support check: radius=%.3f height=[%.3f,%.3f] min_points=%d checked=%zu cleared=%zu; dynamic costs unchanged",
+      static_support_radius_, static_obstacle_min_height_, static_obstacle_max_height_,
+      static_support_min_points_, checked, cleared);
 }
 
 void StaticLayer::generateStaticGraph(){

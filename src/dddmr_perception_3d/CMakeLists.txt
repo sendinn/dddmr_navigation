@@ -249,6 +249,12 @@ install(FILES perception_3d_plugins.xml
 )
 
 #--- Everything below is CI/CD test ---
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(static_support_test test/static_support_test.cpp)
+  target_compile_options(static_support_test PRIVATE -UNDEBUG)
+  add_test(NAME static_support_test COMMAND static_support_test)
+endif()
 
 #Check CI/CD build flag
 if(NOT TEST_ENABLED)

@@ -85,6 +85,7 @@ class StaticLayer: public Sensor{
     void ptrInitial();
     void radiusSearchConnection();
     void generateStaticGraph();
+    void validateStaticSupport();
     
     /*call back of the ground*/
     void cbGround(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
@@ -111,6 +112,9 @@ class StaticLayer: public Sensor{
     double intensity_search_radius_;
     double intensity_search_punish_weight_;
     double static_imposing_radius_;
+    bool static_support_check_;
+    double static_support_radius_;
+    int static_support_min_points_;
     double static_obstacle_min_height_, static_obstacle_max_height_;
     double static_obstacle_half_x_, static_obstacle_half_y_, static_obstacle_value_;
     int static_obstacle_min_points_, static_ground_min_neighbors_;

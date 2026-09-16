@@ -28,6 +28,7 @@
  */
 
 #include <mcl_3dl.h>
+#include <mcl_3dl/planar_constraint.h>
 
 using std::placeholders::_1;
 using std::placeholders::_2;
@@ -58,6 +59,13 @@ bool MCL3dlNode::configure(const std::shared_ptr<mcl_3dl::SubMaps>& sub_maps)
 {
   sub_maps_ = sub_maps;
   params_ = std::make_shared<Parameters>(this->get_node_logging_interface(), this->get_node_parameters_interface());
+  planar_mode_ = this->declare_parameter<bool>("planar_mode", false);
+  stationary_update_interval_ = this->declare_parameter<double>("stationary_update_interval", 0.0);
+  if (!std::isfinite(stationary_update_interval_) || stationary_update_interval_ < 0.0)
+    throw std::invalid_argument("stationary_update_interval must be finite and nonnegative");
+  planar_z_ = params_->initial_pose_.pos_.z_;
+  RCLCPP_INFO(this->get_logger(), "planar_mode: %s, base_link reference z: %.3f",
+              planar_mode_ ? "true" : "false", planar_z_);
   sub_maps_->knn_num_of_ground_normals_ = params_->knn_num_of_ground_normals_;
   
   lidar_measurements_ = std::make_shared<LidarMeasurementModelLikelihood>();
@@ -68,6 +76,7 @@ bool MCL3dlNode::configure(const std::shared_ptr<mcl_3dl::SubMaps>& sub_maps)
                                     ParticleWeightedMeanQuat,
                                     std::default_random_engine>(params_->num_particles_));
   pf_->init(params_->initial_pose_, params_->initial_pose_std_);
+  constrainPlanarParticles();
 
   f_pos_.reset(new FilterVec3(
       Filter::FILTER_LPF,
@@ -142,8 +151,14 @@ bool MCL3dlNode::configure(const std::shared_ptr<mcl_3dl::SubMaps>& sub_maps)
   */
 }
 
+void MCL3dlNode::constrainPlanarParticles()
+{
+  if (!planar_mode_) return;
+  pf_->predict([this](State6DOF& s) { constrainPlanarState(s, planar_z_); });
+}
+
 void MCL3dlNode::cbOdom(const nav_msgs::msg::Odometry::SharedPtr msg){
-  
+  std::unique_lock<std::mutex> lock(protect_measure_in_odomcb_);
   double time_seconds = msg->header.stamp.sec + (msg->header.stamp.nanosec * 1e-9);
   odom_ =
       State6DOF(
@@ -179,7 +194,12 @@ void MCL3dlNode::cbOdom(const nav_msgs::msg::Odometry::SharedPtr msg){
     has_odom_ = true;
     return;
   }
-  
+  updateFromLatestFeatures();
+}
+
+void MCL3dlNode::updateFromLatestFeatures()
+{
+  if (!has_odom_) return;
   double dx = odom_.pos_.x_ - odom_prev_.pos_.x_;
   double dy = odom_.pos_.y_ - odom_prev_.pos_.y_;
   double dz = odom_.pos_.z_ - odom_prev_.pos_.z_;
@@ -196,9 +216,13 @@ void MCL3dlNode::cbOdom(const nav_msgs::msg::Odometry::SharedPtr msg){
   double droll = roll_odom - roll_odom_prev;
   double dpitch = pitch_odom - pitch_odom_prev;
   double dyaw = yaw_odom - yaw_odom_prev;
-  rclcpp::Time msg_time(msg->header.stamp);
+  rclcpp::Time msg_time(odom_header_.stamp);
 
-  if(!first_tf_ || sqrt(dx*dx + dy*dy + dz*dz)>params_->update_min_d_ || sqrt(droll*droll + dpitch*dpitch + dyaw*dyaw)>params_->update_min_a_ ){
+  const int64_t scan_ns = rclcpp::Time(laser_header_.stamp).nanoseconds();
+  const bool stationary_update = stationary_update_interval_ > 0.0 &&
+      scan_ns > last_measurement_scan_ns_ &&
+      (msg_time - odom_last_).seconds() >= stationary_update_interval_;
+  if(!first_tf_ || stationary_update || sqrt(dx*dx + dy*dy + dz*dz)>params_->update_min_d_ || sqrt(droll*droll + dpitch*dpitch + dyaw*dyaw)>params_->update_min_a_ ){
     if(pcl_segmentations_.empty()){
       return;
     }
@@ -209,11 +233,10 @@ void MCL3dlNode::cbOdom(const nav_msgs::msg::Odometry::SharedPtr msg){
       motion_prediction_model_->predict(s);
     };
     pf_->predict(prediction_func);
-    rclcpp::Time last_msg_time(msg->header.stamp);
-    odom_last_ = last_msg_time;
+    odom_last_ = msg_time;
     odom_prev_ = odom_;
     
-    std::unique_lock<std::mutex> lock(protect_measure_in_odomcb_);
+    last_measurement_scan_ns_ = scan_ns;
     measure(pcl_segmentations_);
 
     pf_->resample(State6DOF(
@@ -233,6 +256,7 @@ void MCL3dlNode::cbOdom(const nav_msgs::msg::Odometry::SharedPtr msg){
       s.noise_al_ = noise(engine_) * params_->odom_err_ang_lin_;
     };
     pf_->predict(update_noise_func);
+    constrainPlanarParticles();
 
     publishParticles();
   }
@@ -273,8 +297,6 @@ void MCL3dlNode::cbLeGoFeatureCloud(const sensor_msgs::msg::PointCloud2::SharedP
   
   std::unique_lock<std::mutex> lock(protect_measure_in_odomcb_);
   
-  laser_header_ = pc_less_sharpMsg->header;
-
   if(!sub_maps_->isCurrentReady())
     return;
 
@@ -469,11 +491,18 @@ void MCL3dlNode::cbLeGoFeatureCloud(const sensor_msgs::msg::PointCloud2::SharedP
   
   pcl_segmentations_[std::string("flat")] = pc_flat;
   pcl_segmentations_[std::string("less_sharp")] = pc_less_sharp_intensity;
-  
+  // Commit the stamp with the processed features, never with a rejected input.
+  laser_header_ = pc_less_sharpMsg->header;
+  // Do not hold a ready scan until another odometry packet arrives. The same
+  // update gates and consumed-scan stamp are shared with cbOdom, so a stationary
+  // scan is not counted twice and its measurement stamp is never refreshed.
+  updateFromLatestFeatures();
 }
 
 void MCL3dlNode::measure(std::map<std::string, pcl::PointCloud<mcl_3dl::pcl_t>::Ptr> pcl_segmentations)
 {
+  // Constrain before scoring, not just the published pose/TF.
+  constrainPlanarParticles();
 
   if(!sub_maps_->isCurrentReady())
     return;
@@ -522,6 +551,7 @@ void MCL3dlNode::measure(std::map<std::string, pcl::PointCloud<mcl_3dl::pcl_t>::
         Vec3(params_->expansion_var_roll_,
               params_->expansion_var_pitch_,
               params_->expansion_var_yaw_)));
+    constrainPlanarParticles();
     return;
   }
 
@@ -555,6 +585,7 @@ void MCL3dlNode::measure(std::map<std::string, pcl::PointCloud<mcl_3dl::pcl_t>::
 
   //@ Weight particle based on the observation weight and p.probability_bias_
   auto e = pf_->expectationBiased();
+  if (planar_mode_) constrainPlanarState(e, planar_z_);
   const auto e_max = pf_->max();
 
   assert(std::isfinite(e.pos_.x_));
@@ -625,6 +656,9 @@ void MCL3dlNode::measure(std::map<std::string, pcl::PointCloud<mcl_3dl::pcl_t>::
 
   geometry_msgs::msg::PoseWithCovarianceStamped pose;
   pose.header.stamp = odom_last_;
+  // A recent odometry callback must not make an old lidar match look fresh.
+  if (rclcpp::Time(laser_header_.stamp) < odom_last_)
+    pose.header.stamp = laser_header_.stamp;
   pose.header.frame_id = map2odom_trans_.header.frame_id;
   pose.pose.pose.position.x = e.pos_.x_;
   pose.pose.pose.position.y = e.pos_.y_;
@@ -715,6 +749,7 @@ void MCL3dlNode::publishParticles()
 
 void MCL3dlNode::publishTFThread()
 {
+  std::unique_lock<std::mutex> lock(protect_measure_in_odomcb_);
   if (tf_ready_ && params_->publish_tf_){
     if(laser_header_.stamp.sec==0 && laser_header_.stamp.nanosec == 0){
       laser_header_.stamp = odom_header_.stamp;
@@ -727,12 +762,18 @@ void MCL3dlNode::publishTFThread()
 }
 
 void MCL3dlNode::cbPosition(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg){
+  if (!std::isfinite(msg->pose.pose.position.x) ||
+      !std::isfinite(msg->pose.pose.position.y) ||
+      !std::isfinite(msg->pose.pose.position.z)) {
+    RCLCPP_ERROR(this->get_logger(), "Discarded non-finite initial pose position");
+    return;
+  }
   const double len2 =
       msg->pose.pose.orientation.x * msg->pose.pose.orientation.x +
       msg->pose.pose.orientation.y * msg->pose.pose.orientation.y +
       msg->pose.pose.orientation.z * msg->pose.pose.orientation.z +
       msg->pose.pose.orientation.w * msg->pose.pose.orientation.w;
-  if (std::abs(len2 - 1.0) > 0.1)
+  if (!std::isfinite(len2) || std::abs(len2 - 1.0) > 0.1)
   {
     RCLCPP_ERROR(this->get_logger(), "Discarded invalid initialpose. The orientation must be unit quaternion.");
     return;
@@ -743,40 +784,19 @@ void MCL3dlNode::cbPosition(const geometry_msgs::msg::PoseWithCovarianceStamped:
     return;
   }
 
+  std::unique_lock<std::mutex> lock(protect_measure_in_odomcb_);
   sub_maps_->setInitialPose(*msg);
   while(rclcpp::ok() && !sub_maps_->isWarmUpReady()){
 
   }
   sub_maps_->swapKdTree();
   
-  //@Try to find the ground
+  // initial_3d_pose describes robot_frame (base_link), not a ground contact.
+  // The WebUI supplies the nearest mapping keyframe's robot height.
+  // Snapping this origin to mapground incorrectly lowers the entire scan.
   geometry_msgs::msg::PoseStamped pose;
-  mcl_3dl::pcl_t initial_pose_pt;
-  std::vector<int> pointIdxRadiusSearch;
-  std::vector<float> pointRadiusSquaredDistance;
-  initial_pose_pt.x = msg->pose.pose.position.x;
-  initial_pose_pt.y = msg->pose.pose.position.y;
-  initial_pose_pt.z = msg->pose.pose.position.z;
-  pose.pose.position.x = initial_pose_pt.x;
-  pose.pose.position.y = initial_pose_pt.y;
-  pose.pose.orientation = msg->pose.pose.orientation;
-  
-  for(double z=0.0; z<5.0;z+=0.1){
-    initial_pose_pt.z = msg->pose.pose.position.z + z;
-    if(sub_maps_->kdtree_ground_current_.radiusSearch(initial_pose_pt, 0.3, pointIdxRadiusSearch, pointRadiusSquaredDistance, 1)>0)
-    {
-      pose.pose.position.z = sub_maps_->ground_current_->points[pointIdxRadiusSearch[0]].z;
-      RCLCPP_INFO(this->get_logger(), "Found ground at z: %.2f", pose.pose.position.z);
-      break;
-    }
-    initial_pose_pt.z = msg->pose.pose.position.z - z;
-    if(sub_maps_->kdtree_ground_current_.radiusSearch(initial_pose_pt, 0.3, pointIdxRadiusSearch, pointRadiusSquaredDistance, 1)>0)
-    {
-      pose.pose.position.z = sub_maps_->ground_current_->points[pointIdxRadiusSearch[0]].z;
-      RCLCPP_INFO(this->get_logger(), "Found ground at z: %.2f", pose.pose.position.z);
-      break;
-    }
-  }
+  pose.pose = msg->pose.pose;
+  planar_z_ = pose.pose.position.z;
   
   RCLCPP_INFO(this->get_logger(), "Set initial pose at: %.2f, %.2f, %.2f", pose.pose.position.x, pose.pose.position.y, pose.pose.position.z);
   double time_seconds = msg->header.stamp.sec + (msg->header.stamp.nanosec * 1e-9);
@@ -788,6 +808,7 @@ void MCL3dlNode::cbPosition(const geometry_msgs::msg::PoseWithCovarianceStamped:
                         time_seconds);
   const MultivariateNoiseGenerator<float> noise_gen(mean, msg->pose.covariance);
   pf_->initUsingNoiseGenerator(noise_gen);
+  constrainPlanarParticles();
 
   auto integ_reset_func = [](State6DOF& s)
   {
