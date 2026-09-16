@@ -105,7 +105,7 @@ FeatureAssociation::FeatureAssociation(std::string name, Channel<ProjectionOut> 
   rclcpp::SubscriptionOptions sub_options;
   sub_options.callback_group = odom_cb_group_;
   subOdom = this->create_subscription<nav_msgs::msg::Odometry>(
-      "odom", rclcpp::QoS(rclcpp::KeepLast(1)).durability_volatile().best_effort(),
+      "odom", rclcpp::QoS(rclcpp::KeepLast(200)).durability_volatile().best_effort(),
       std::bind(&FeatureAssociation::odomHandler, this, std::placeholders::_1), sub_options);
 
   //initializationValue();
@@ -196,6 +196,79 @@ void FeatureAssociation::tfInitial(){
 }
 
 void FeatureAssociation::odomHandler(const nav_msgs::msg::Odometry::SharedPtr odomIn){
+  // Only this buffer is shared with the processing callback. Never mutate the
+  // pose currently being used for feature extraction/map TF from this thread.
+  std::lock_guard<std::mutex> lock(_odom_mutex);
+  const auto ns = rclcpp::Time(odomIn->header.stamp).nanoseconds();
+  if (!odom_history_.empty() && ns <= rclcpp::Time(odom_history_.back().header.stamp).nanoseconds()) {
+    if (ns == rclcpp::Time(odom_history_.back().header.stamp).nanoseconds()) return;
+    odom_history_.clear();
+  }
+  odom_history_.push_back(*odomIn);
+  while (odom_history_.size() > 2000) odom_history_.pop_front();
+}
+
+bool FeatureAssociation::matchOdometry(const builtin_interfaces::msg::Time& stamp) {
+  const int64_t target = rclcpp::Time(stamp).nanoseconds();
+  nav_msgs::msg::Odometry matched;
+  bool found = false;
+  {
+    std::lock_guard<std::mutex> lock(_odom_mutex);
+    for (size_t i = 0; i < odom_history_.size(); ++i) {
+      const auto& hi = odom_history_[i];
+      const int64_t high = rclcpp::Time(hi.header.stamp).nanoseconds();
+      if (high < target) continue;
+      if (high == target) { matched = hi; found = true; break; }
+      if (i == 0) break;
+      const auto& lo = odom_history_[i - 1];
+      const int64_t low = rclcpp::Time(lo.header.stamp).nanoseconds();
+      // Do not interpolate over sensor dropouts or a frame change.
+      if (high - low > 250000000 || hi.header.frame_id != lo.header.frame_id ||
+          hi.child_frame_id != lo.child_frame_id) break;
+      const double t = static_cast<double>(target - low) / (high - low);
+      matched = lo;
+      auto& p = matched.pose.pose.position;
+      p.x += t * (hi.pose.pose.position.x - p.x);
+      p.y += t * (hi.pose.pose.position.y - p.y);
+      p.z += t * (hi.pose.pose.position.z - p.z);
+      const auto& a = lo.pose.pose.orientation;
+      const auto& b = hi.pose.pose.orientation;
+      tf2::Quaternion qa(a.x, a.y, a.z, a.w), qb(b.x, b.y, b.z, b.w);
+      if (!(qa.length2() > 1e-12) || !(qb.length2() > 1e-12)) break;
+      qa.normalize(); qb.normalize();
+      const auto q = qa.slerp(qb, t).normalized();
+      matched.pose.pose.orientation.x = q.x();
+      matched.pose.pose.orientation.y = q.y();
+      matched.pose.pose.orientation.z = q.z();
+      matched.pose.pose.orientation.w = q.w();
+      matched.header.stamp = stamp;  // Pose was actually interpolated to this time.
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *clock_, 5000,
+        "Drop scan: no bracketing odometry within 0.25 s at %.6f; no extrapolation",
+        target * 1e-9);
+    return false;
+  }
+  const auto& p = matched.pose.pose.position;
+  auto& q = matched.pose.pose.orientation;
+  const double norm = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+  if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+      !std::isfinite(norm) || norm < 1e-6) return false;
+  q.x /= norm; q.y /= norm; q.z /= norm; q.w /= norm;
+  if (matched.child_frame_id != baselink_frame_) {
+    RCLCPP_ERROR_THROTTLE(get_logger(), *clock_, 5000,
+        "External odometry child must be %s, received %s; drop scan",
+        baselink_frame_.c_str(), matched.child_frame_id.c_str());
+    return false;
+  }
+  applyMatchedOdometry(std::make_shared<nav_msgs::msg::Odometry>(matched));
+  return true;
+}
+
+void FeatureAssociation::applyMatchedOdometry(const nav_msgs::msg::Odometry::SharedPtr odomIn){
   
   odom_topic_alive_ = true;
   exteralOdometry = (*odomIn);
@@ -1355,10 +1428,8 @@ void FeatureAssociation::assignMappingOdometry(float (&ts)[6]){
     tf2::convert(quat_tf, geoQuat);
     double odom_time = static_cast<double>(exteralOdometry.header.stamp.sec) + static_cast<double>(exteralOdometry.header.stamp.nanosec) * 1e-9;
     double cloud_time = static_cast<double>(cloudHeader.stamp.sec) + static_cast<double>(cloudHeader.stamp.nanosec) * 1e-9;
-    if(fabs(odom_time-cloud_time)>1.0){
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Time differ from odom msg and lidar msg: %.3f, overwrite odom stamp by lidar stamp", fabs(odom_time-cloud_time));
-      exteralOdometry.header.stamp = cloudHeader.stamp;
-    }
+    // External pose and header are paired by matchOdometry; never relabel a
+    // latest-arrival pose with the scan timestamp.
     mappingOdometry.header.stamp = cloudHeader.stamp;
     mappingOdometry.pose.pose.orientation.x = -geoQuat.y;
     mappingOdometry.pose.pose.orientation.y = -geoQuat.z;
@@ -1493,7 +1564,6 @@ void FeatureAssociation::runFeatureAssociation() {
   _input_channel.receive(projection);
 
   //--------------
-  std::lock_guard<std::mutex> lock(_odom_mutex);
 
   outlierCloud = projection.outlier_cloud;
   segmentedCloud = projection.segmented_cloud;
@@ -1523,6 +1593,7 @@ void FeatureAssociation::runFeatureAssociation() {
     initialize_laser_odom_at_first_frame_ = true;
     return;
   }
+  if (odom_type_ != "laser_odometry" && !matchOdometry(cloudHeader.stamp)) return;
   adjustDistortion();
 
   calculateSmoothness();

@@ -30,6 +30,8 @@
 */
 /*Debug*/
 #include <chrono>
+#include <atomic>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <p2p_move_base/p2p_state.h>
 
 //@in enum state, the p_to_p_move_base is included
@@ -112,6 +114,13 @@ class P2PMoveBase : public rclcpp::Node {
     void recovery_behaviors_client_result_callback(const rclcpp_action::ClientGoalHandle<dddmr_sys_core::action::RecoveryBehaviors>::WrappedResult & result);
     bool is_recoverying_;
     bool enable_rotate_recovery_ = true;
+    double localization_timeout_ = 0.0;
+    std::atomic<int64_t> localization_valid_until_{0};
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr localization_sub_;
+    bool stop_after_heading_alignment_ = false;
+    unsigned heading_stopped_samples_ = 0;
+    int64_t heading_last_odom_stamp_ = 0;
+    std::chrono::steady_clock::time_point heading_stop_started_;
     bool progress_control_started_ = false;
     bool is_recoverying_succeed_;
     void startRecoveryBehaviors(std::string behavior_name);

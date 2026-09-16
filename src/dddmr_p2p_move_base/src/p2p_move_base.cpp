@@ -37,7 +37,30 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
 {
   name_ = name;
   clock_ = this->get_clock();
+  localization_timeout_ = declare_parameter<double>("localization_timeout", 0.0);
+  const double xy_limit = declare_parameter<double>("localization_xy_std_max", 0.15);
+  const double yaw_limit = declare_parameter<double>("localization_yaw_std_max", 0.20);
+  if (!std::isfinite(localization_timeout_) || localization_timeout_ < 0.0 ||
+      !std::isfinite(xy_limit) || xy_limit <= 0.0 || !std::isfinite(yaw_limit) || yaw_limit <= 0.0)
+    throw std::invalid_argument("Invalid localization safety thresholds");
+  if (localization_timeout_ > 0.0) {
+    localization_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      "mcl_pose", rclcpp::QoS(1).best_effort(),
+      [this, xy_limit, yaw_limit](geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg) {
+        const auto& c = msg->pose.covariance;
+        const double age = (clock_->now() - rclcpp::Time(msg->header.stamp)).seconds();
+        const bool valid = std::isfinite(c[0]) && c[0] >= 0 && c[0] <= xy_limit * xy_limit &&
+          std::isfinite(c[7]) && c[7] >= 0 && c[7] <= xy_limit * xy_limit &&
+          std::isfinite(c[35]) && c[35] >= 0 && c[35] <= yaw_limit * yaw_limit &&
+          msg->header.stamp.sec > 0 && age >= 0 && age < localization_timeout_;
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        localization_valid_until_.store(valid ? now + static_cast<int64_t>(
+            (localization_timeout_ - age) * 1e9) : 0);
+      });
+  }
   enable_rotate_recovery_ = declare_parameter<bool>("enable_rotate_recovery", true);
+  stop_after_heading_alignment_ = declare_parameter<bool>("stop_after_heading_alignment", false);
   RCLCPP_INFO(get_logger(), "enable_rotate_recovery: %s",
       enable_rotate_recovery_ ? "true" : "false");
 }
@@ -296,6 +319,24 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
 }
 
 bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHandle<dddmr_sys_core::action::PToPMoveBase>> goal_handle){
+    const auto steady_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (localization_timeout_ > 0.0 && steady_now >= localization_valid_until_.load()) {
+      publishZeroVelocity();
+      recovery_behaviors_client_ptr_->async_cancel_all_goals();
+      RCLCPP_ERROR(get_logger(), "Localization absent, stale or uncertain: aborting navigation; a new goal is required.");
+      auto result = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>();
+      goal_handle->abort(result);
+      return true;
+    }
+    if (GPM_->planningUnsafe()) {
+      publishZeroVelocity();
+      recovery_behaviors_client_ptr_->async_cancel_all_goals();
+      RCLCPP_ERROR(get_logger(), "Planning unavailable/stale: navigation aborted, cached local path disabled.");
+      auto result = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>();
+      goal_handle->abort(result);
+      return true;
+    }
 
     STATE_->global_pose_ = LP_->getGlobalPose();
     LP_->syncRobotState(robot_state_, ackermann_drive_state_);
@@ -357,7 +398,16 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
     else if(STATE_->isCurrentDecision("d_align_heading")){
 
       if(LP_->isInitialHeadingAligned()){
-        STATE_->setDecision("d_controlling");  
+        if (stop_after_heading_alignment_) {
+          publishZeroVelocity();
+          heading_stopped_samples_ = 0;
+          heading_last_odom_stamp_ = rclcpp::Time(robot_state_.header.stamp).nanoseconds();
+          heading_stop_started_ = std::chrono::steady_clock::now();
+          STATE_->setDecision("d_heading_stopping");
+          RCLCPP_INFO(get_logger(), "Heading aligned: braking before path tracking.");
+        } else {
+          STATE_->setDecision("d_controlling");
+        }
       }
       else{
 
@@ -431,6 +481,35 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         }
       }
 
+    }
+
+    else if (STATE_->isCurrentDecision("d_heading_stopping")) {
+      publishZeroVelocity();
+      const double elapsed = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - heading_stop_started_).count();
+      const auto stamp = rclcpp::Time(robot_state_.header.stamp);
+      const double age = (clock_->now() - stamp).seconds();
+      const auto& velocity = robot_state_.twist.twist;
+      const double speed = std::hypot(velocity.linear.x, velocity.linear.y);
+      const bool stopped = stamp.nanoseconds() > 0 && age >= 0.0 && age <= 0.5 &&
+          std::isfinite(speed) && std::isfinite(velocity.angular.z) &&
+          speed <= 0.03 && std::abs(velocity.angular.z) <= 0.05;
+      if (!stopped) heading_stopped_samples_ = 0;
+      else if (stamp.nanoseconds() > heading_last_odom_stamp_) ++heading_stopped_samples_;
+      heading_last_odom_stamp_ = stamp.nanoseconds();
+      if (elapsed >= 5.0) {
+        RCLCPP_ERROR(get_logger(), "Heading braking timeout: speed=%.3f, yaw_rate=%.3f, odom_age=%.3f; aborting.",
+            speed, velocity.angular.z, age);
+        auto result = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>();
+        goal_handle->abort(result);
+        return true;
+      }
+      if (heading_stopped_samples_ >= 3) {
+        STATE_->last_valid_control_ = clock_->now();
+        STATE_->setDecision(LP_->isInitialHeadingAligned() ? "d_controlling" : "d_align_heading");
+        RCLCPP_INFO(get_logger(), "Heading braking verified on three fresh odometry samples; heading rechecked.");
+      }
+      return false;
     }
 
     else if(STATE_->isCurrentDecision("d_align_goal_heading")){

@@ -46,6 +46,10 @@ void OmniSimpleTrajectoryGeneratorTheory::configurateActuatorType(){
 
 void OmniSimpleTrajectoryGeneratorTheory::onInitialize(){
 
+  sample_braking_commands_ = node_->declare_parameter<bool>(name_ + ".sample_braking_commands", false);
+  RCLCPP_INFO(node_->get_logger().get_child(name_), "sample_braking_commands: %s",
+      sample_braking_commands_ ? "true" : "false");
+
   //@initialize trajectory generator
   limits_ = std::make_shared<trajectory_generators::OmniTrajectoryGeneratorLimits>();
   
@@ -313,6 +317,30 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
       max_vel[1] = std::min(max_vel_y, shared_data_->robot_state_.twist.twist.linear.y/limits_->deceleration_ratio);
     }
 
+    // An overspeed measurement can make the reachable interval disjoint
+    // from command limits. Request the nearest legal boundary and simulate
+    // the actual braking transient below; never sample a reversed interval.
+    const Eigen::Vector3f command_min(min_vel_x, min_vel_y, min_vel_th);
+    const Eigen::Vector3f command_max(max_vel_x, max_vel_y, max_vel_th);
+    for (int axis = 0; axis < 3; ++axis) {
+      if (!std::isfinite(min_vel[axis]) || !std::isfinite(max_vel[axis]) ||
+          command_min[axis] > command_max[axis]) return;
+      min_vel[axis] = std::clamp(min_vel[axis], command_min[axis], command_max[axis]);
+      max_vel[axis] = std::clamp(max_vel[axis], command_min[axis], command_max[axis]);
+      if (min_vel[axis] > max_vel[axis]) return;
+    }
+    // Samples are commanded setpoints, not instantaneous achieved velocities.
+    // Permit braking toward zero even when measured overspeed excludes zero
+    // from the one-cycle window. generateTrajectory still integrates the
+    // measured velocity and finite deceleration; it never assumes instant stop.
+    if (sample_braking_commands_) {
+      for (int axis = 0; axis < 3; ++axis) {
+        if (command_min[axis] <= 0.0f && command_max[axis] >= 0.0f) {
+          min_vel[axis] = std::min(min_vel[axis], 0.0f);
+          max_vel[axis] = std::max(max_vel[axis], 0.0f);
+        }
+      }
+    }
     Eigen::Vector3f vel_samp = Eigen::Vector3f::Zero();
     trajectory_generators::VelocityIterator x_it(min_vel[0], max_vel[0], params_->linear_x_sample);
     trajectory_generators::VelocityIterator y_it(min_vel[1], max_vel[1], params_->linear_y_sample);
@@ -373,12 +401,28 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
   traj.cost_ = 0.0; // placed here in case we return early
   //trajectory might be reused so we'll make sure to reset it
   traj.resetPoses();
+  const auto& measured = shared_data_->robot_state_.twist.twist;
+  Eigen::Vector3f initial_velocity(measured.linear.x, measured.linear.y, measured.angular.z);
+  if (!sample_target_vel.allFinite() || !initial_velocity.allFinite() ||
+      sample_target_vel[0] < limits_->min_vel_x - eps ||
+      sample_target_vel[0] > limits_->max_vel_x + eps ||
+      sample_target_vel[1] < limits_->min_vel_y - eps ||
+      sample_target_vel[1] > limits_->max_vel_y + eps ||
+      std::abs(sample_target_vel[2]) > limits_->max_vel_theta + eps) return false;
+  const Eigen::Vector3f acceleration = limits_->getAccLimits();
+  if (!acceleration.allFinite() || (acceleration.array() <= 0).any() ||
+      !std::isfinite(limits_->deceleration_ratio) || limits_->deceleration_ratio <= 0 ||
+      !std::isfinite(params_->sim_time) || params_->sim_time <= 0 ||
+      !std::isfinite(params_->sim_granularity) || params_->sim_granularity <= 0 ||
+      !std::isfinite(params_->angular_sim_granularity) || params_->angular_sim_granularity <= 0 ||
+      !std::isfinite(params_->controller_frequency) || params_->controller_frequency <= 0) return false;
 
   RCLCPP_DEBUG(node_->get_logger().get_child(name_), "Trajectory by state x: %.2f, y: %.2f, w: %.2f", sample_target_vel[0], sample_target_vel[1], sample_target_vel[2]);
 
   // make sure that the robot would at least be moving with one of
   // the required minimum velocities for translation and rotation (if set)
-  if ((limits_->min_vel_trans >= 0 && vmag + eps < limits_->min_vel_trans) &&
+  const bool braking_stop = sample_braking_commands_ && sample_target_vel.isZero(0.0f);
+  if (!braking_stop && (limits_->min_vel_trans >= 0 && vmag + eps < limits_->min_vel_trans) &&
       (limits_->min_vel_theta >= 0 && fabs(sample_target_vel[2]) + eps < limits_->min_vel_theta)) {
     return false;
   }
@@ -397,19 +441,23 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
   int num_steps;
 
   //compute the number of steps we must take along this trajectory to be "safe"
-  double sim_time_distance = vmag * params_->sim_time; // the distance the robot would travel in sim_time if it did not change velocity
-  double sim_time_angle = fabs(sample_target_vel[2]) * params_->sim_time; // the angle the robot would rotate in sim_time
+  // Bound both current and target speeds, including mixed-axis transients.
+  double sim_time_distance = std::hypot(
+      std::max(std::abs(initial_velocity[0]), std::abs(sample_target_vel[0])),
+      std::max(std::abs(initial_velocity[1]), std::abs(sample_target_vel[1]))) * params_->sim_time;
+  double sim_time_angle = std::max(std::abs(initial_velocity[2]), std::abs(sample_target_vel[2])) * params_->sim_time;
   num_steps =
       ceil(std::max(sim_time_distance / params_->sim_granularity,
           sim_time_angle / params_->angular_sim_granularity));
   
 
-  if (num_steps == 0) {
+  if (num_steps == 0 && !braking_stop) {
     return false;
   }
   // Low-speed startup still needs a trajectory, not a single endpoint.
   // Increasing subdivision preserves the horizon and tightens collision checks.
   num_steps = std::max(2, num_steps);
+  num_steps = std::max(num_steps, static_cast<int>(std::ceil(params_->sim_time * params_->controller_frequency)));
 
   //compute a timestep
   double dt = params_->sim_time / num_steps;
@@ -424,7 +472,7 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
   Eigen::Vector3f loop_vel;
 
   // assuming sample_vel is our target velocity within acc limits for one timestep
-  loop_vel = sample_target_vel;
+  loop_vel = initial_velocity;
   traj.xv_     = sample_target_vel[0];
   traj.yv_     = sample_target_vel[1];
   traj.thetav_ = sample_target_vel[2];
@@ -435,7 +483,30 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
   for (int i = 0; i < num_steps; ++i) {
 
     //update the position of the robot using the velocities passed in
-    pos = computeNewPositions(pos, loop_vel, dt);
+    Eigen::Vector3f average_velocity;
+    for (int axis = 0; axis < 3; ++axis) {
+      double velocity = loop_vel[axis];
+      const double target = sample_target_vel[axis];
+      double remaining = dt;
+      double displacement = 0.0;
+      // Reverse direction by braking to zero first, then accelerating.
+      for (int phase = 0; phase < 2 && remaining > 0.0; ++phase) {
+        const double phase_target = velocity * target < 0.0 ? 0.0 : target;
+        const double rate = acceleration[axis] *
+            (std::abs(phase_target) < std::abs(velocity) ? limits_->deceleration_ratio : 1.0);
+        const double delta = phase_target - velocity;
+        const double duration = std::min(remaining, std::abs(delta) / rate);
+        const double next = velocity + std::copysign(rate * duration, delta);
+        displacement += 0.5 * (velocity + next) * duration;
+        velocity = duration >= std::abs(delta) / rate ? phase_target : next;
+        remaining -= duration;
+        if (velocity == target) break;
+      }
+      displacement += velocity * remaining;
+      average_velocity[axis] = displacement / dt;
+      loop_vel[axis] = velocity;
+    }
+    pos = computeNewPositions(pos, average_velocity, dt);
 
     /*transform back to global frame*/
     Eigen::Affine3d trans_gbl2traj_af3;

@@ -3,6 +3,7 @@
 
 #include "utility.h"
 #include "channel.h"
+#include <deque>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <Eigen/Eigenvalues>
 #include <Eigen/QR>
@@ -30,6 +31,9 @@ class FeatureAssociation : public rclcpp::Node
   ~FeatureAssociation();
 
   void odomHandler(const nav_msgs::msg::Odometry::SharedPtr odomIn);
+  void applyMatchedOdometry(const nav_msgs::msg::Odometry::SharedPtr odomIn);
+  bool matchOdometry(const builtin_interfaces::msg::Time& stamp);
+  std::deque<nav_msgs::msg::Odometry> odom_history_;
   void runFeatureAssociation();
   void tfInitial();
   bool systemInitedLM;

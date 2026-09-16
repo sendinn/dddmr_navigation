@@ -71,6 +71,7 @@ class OmniSimpleTrajectoryGeneratorTheory: public TrajectoryGeneratorTheory{
     std::shared_ptr<trajectory_generators::OmniTrajectoryGeneratorParams> params_;
 
     unsigned int next_sample_index_;
+    bool sample_braking_commands_ = false;
     // to store sample params of each sample between init and generation
     std::vector<Eigen::Vector3f> sample_params_;
 };

@@ -66,8 +66,9 @@ void DWA_GlobalPlanner::handle_accepted(const std::shared_ptr<rclcpp_action::Ser
   }
   current_handle_.reset();
   current_handle_ = goal_handle;
-  // this needs to return quickly to avoid blocking the executor, so spin up a new thread
-  std::thread{std::bind(&DWA_GlobalPlanner::makePlan, this, std::placeholders::_1), goal_handle}.detach();
+  // Keep path/KD-tree initialization in the same mutually-exclusive callback
+  // group as the replan timer. A detached thread bypasses that protection.
+  makePlan(goal_handle);
 }
   
 void DWA_GlobalPlanner::initial(const std::shared_ptr<perception_3d::Perception3D_ROS>& perception_3d, 
@@ -158,6 +159,7 @@ void DWA_GlobalPlanner::makePlan(const std::shared_ptr<rclcpp_action::ServerGoal
     result->path = global_path_;
 
     if(global_path_.poses.empty()){
+      threading_timer_->cancel();
       goal_handle->abort(result);
     }
     else{
@@ -179,18 +181,26 @@ void DWA_GlobalPlanner::makePlan(const std::shared_ptr<rclcpp_action::ServerGoal
       threading_timer_->reset();
     }
     pub_path_->publish(global_path_);
-    global_dwa_path_.poses.clear();
+    global_dwa_path_ = global_path_;
   }
   else{
     auto result = std::make_shared<dddmr_sys_core::action::GetPlan::Result>();
     result->path = global_dwa_path_;
-    goal_handle->succeed(result);
+    if (global_dwa_path_.poses.empty()) goal_handle->abort(result);
+    else goal_handle->succeed(result);
     pub_path_->publish(global_dwa_path_);
   }
   
 }
 
 void DWA_GlobalPlanner::determineDWAPlan(){
+  if (!kdtree_global_path_ || pcl_global_path_->empty() ||
+      global_path_.poses.size() != pcl_global_path_->size()) {
+    global_dwa_path_.poses.clear();
+    threading_timer_->cancel();
+    RCLCPP_ERROR(get_logger(), "DWA reference path/KD-tree unavailable or inconsistent; replanning stopped.");
+    return;
+  }
 
   geometry_msgs::msg::PoseStamped start;
   perception_3d_ros_->getGlobalPose(start);
@@ -284,6 +294,15 @@ void DWA_GlobalPlanner::determineDWAPlan(){
         start.pose.position.x, start.pose.position.y, start.pose.position.z);
 
   nav_msgs::msg::Path dwa_path = global_planner_->makeROSPlan(start, dwa_goal);
+  if (dwa_path.poses.empty()) {
+    global_dwa_path_ = dwa_path;
+    global_dwa_path_.header.frame_id = global_frame_;
+    global_dwa_path_.header.stamp = clock_->now();
+    pub_path_->publish(global_dwa_path_);
+    RCLCPP_WARN_THROTTLE(get_logger(), *clock_, 2000,
+        "DWA replan failed: publishing empty path without old reference tail.");
+    return;
+  }
   for(size_t i=dwa_pivot; i<pcl_global_path_->points.size(); i++){
     dwa_path.poses.push_back(global_path_.poses[i]);
   }

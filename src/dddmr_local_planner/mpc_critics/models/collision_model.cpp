@@ -51,7 +51,7 @@ void CollisionModel::onInitialize(){
 double CollisionModel::scoreTrajectory(base_trajectory::Trajectory &traj){
   
   if(shared_data_->pcl_perception_->points.size()<5){
-    return 0.0;
+    return -1.0;  // Missing observations are not evidence of free space.
   }
   
 

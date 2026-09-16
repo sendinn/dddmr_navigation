@@ -47,6 +47,7 @@ void StaticLayer::onInitialize()
 { 
   
   ptrInitial();
+  node_->declare_parameter<bool>(name_ + ".collision_observation", false);
 
   cbs_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   rclcpp::SubscriptionOptions sub_options;
@@ -431,6 +432,11 @@ double StaticLayer::get_dGraphValue(const unsigned int index){
 }
 
 bool StaticLayer::isCurrent(){
+  if (is_local_planner_ && node_->get_parameter(name_ + ".collision_observation").as_bool()) {
+    std::unique_lock<std::recursive_mutex> lock(shared_data_->ground_kdtree_cb_mutex_);
+    current_ = is_ground_and_map_being_initialized_once_ && !pcl_map_->empty() && !pcl_ground_->empty();
+    return current_;
+  }
   
   current_ = true;
 
@@ -438,6 +444,10 @@ bool StaticLayer::isCurrent(){
 }
 
 pcl::PointCloud<pcl::PointXYZI>::Ptr StaticLayer::getObservation(){
+  if (is_local_planner_ && node_->get_parameter(name_ + ".collision_observation").as_bool()) {
+    std::unique_lock<std::recursive_mutex> lock(shared_data_->ground_kdtree_cb_mutex_);
+    return std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(*pcl_map_);
+  }
   return sensor_current_observation_;
 }
 pcl::PointCloud<pcl::PointXYZI>::Ptr StaticLayer::getLethal(){

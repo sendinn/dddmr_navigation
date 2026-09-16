@@ -68,6 +68,10 @@ private:
   double global_plan_query_frequency_;
   geometry_msgs::msg::PoseStamped goal_;
   bool is_planning_;
+  bool failed_ = false;
+  uint64_t generation_ = 0;
+  double result_timeout_ = 2.0;
+  std::chrono::steady_clock::time_point last_result_time_;
   bool got_first_goal_;
   nav_msgs::msg::Path global_path_;
 
@@ -94,6 +98,7 @@ public:
   void resume();
   void stop();
   bool hasPlan();
+  bool planningUnsafe();
   void copyPlan(std::vector<geometry_msgs::msg::PoseStamped>& plan);
 
 };

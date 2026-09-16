@@ -1032,13 +1032,23 @@ double MultiLayerSpinningLidar::get_dGraphValue(const unsigned int index){
 }
 
 bool MultiLayerSpinningLidar::isCurrent(){
+  std::unique_lock<std::recursive_mutex> lock(shared_data_->ground_kdtree_cb_mutex_);
+  if (is_local_planner_ && sensor_current_observation_->size() < 5) {
+    current_ = false;
+    RCLCPP_WARN_THROTTLE(node_->get_logger().get_child(name_), *clock_, 3000,
+        "Insufficient live obstacle observations: %zu; motion inhibited", sensor_current_observation_->size());
+    return false;
+  }
   
   auto time_diff = (clock_->now() - last_observation_time_).seconds();
-  if(time_diff > expected_sensor_time_) {
+  const rclcpp::Time input_stamp(last_sensor_receiving_time_.stamp);
+  const double input_age = (clock_->now() - input_stamp).seconds();
+  if(time_diff > expected_sensor_time_ || input_stamp.nanoseconds() <= 0 ||
+      input_age < 0.0 || input_age > expected_sensor_time_) {
     current_ = false;
     RCLCPP_WARN_THROTTLE(node_->get_logger().get_child(name_), *clock_, 5000,
-        "Perception stale: topic=%s, since_last_processed=%.3f s, timeout=%.3f s",
-        topic_.c_str(), time_diff, expected_sensor_time_);
+        "Perception stale: topic=%s, since_last_processed=%.3f s, input_age=%.3f s, timeout=%.3f s",
+        topic_.c_str(), time_diff, input_age, expected_sensor_time_);
   } else
     current_ = true;
 
@@ -1046,7 +1056,8 @@ bool MultiLayerSpinningLidar::isCurrent(){
 }
 
 pcl::PointCloud<pcl::PointXYZI>::Ptr MultiLayerSpinningLidar::getObservation(){
-  return sensor_current_observation_;
+  std::unique_lock<std::recursive_mutex> lock(shared_data_->ground_kdtree_cb_mutex_);
+  return std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(*sensor_current_observation_);
 }
 
 pcl::PointCloud<pcl::PointXYZI>::Ptr MultiLayerSpinningLidar::getLethal(){

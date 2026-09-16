@@ -41,6 +41,9 @@ P2PGlobalPlanManager::~P2PGlobalPlanManager(){
 }
 
 void P2PGlobalPlanManager::initial(){
+  result_timeout_ = declare_parameter<double>("plan_result_timeout", 2.0);
+  if (!std::isfinite(result_timeout_) || result_timeout_ <= 0.0)
+    throw std::invalid_argument("plan_result_timeout must be positive and finite");
 
   this->declare_parameter("global_planner_action_name", rclcpp::ParameterValue("get_plan"));
   this->get_parameter("global_planner_action_name", global_planner_action_name_);
@@ -81,6 +84,10 @@ void P2PGlobalPlanManager::initial(){
 }
 
 void P2PGlobalPlanManager::resume(){
+  std::unique_lock<std::mutex> lock(access_);
+  ++generation_;
+  failed_ = false;
+  last_result_time_ = std::chrono::steady_clock::now();
   global_path_.poses.clear();
   is_planning_ = false;
   loop_timer_->reset();
@@ -88,16 +95,15 @@ void P2PGlobalPlanManager::resume(){
 }
 
 void P2PGlobalPlanManager::stop(){
+  std::unique_lock<std::mutex> lock(access_);
+  ++generation_;
   loop_timer_->cancel();
   
   if(got_first_goal_){
     auto goal_msg = dddmr_sys_core::action::GetPlan::Goal();
     goal_msg.activate_threading = false;
     auto send_goal_options = rclcpp_action::Client<dddmr_sys_core::action::GetPlan>::SendGoalOptions();
-    send_goal_options.goal_response_callback =
-      std::bind(&P2PGlobalPlanManager::global_planner_client_goal_response_callback, this, std::placeholders::_1);
-    send_goal_options.result_callback =
-      std::bind(&P2PGlobalPlanManager::global_planner_client_result_callback, this, std::placeholders::_1);
+    // Stop acknowledgements contain no path and must not affect a later goal.
     global_planner_client_ptr_->async_send_goal(goal_msg, send_goal_options);
     got_first_goal_ = false;
   }
@@ -120,11 +126,18 @@ void P2PGlobalPlanManager::queryThread(){
   goal_msg.activate_threading = true;
 
   auto send_goal_options = rclcpp_action::Client<dddmr_sys_core::action::GetPlan>::SendGoalOptions();
-  
-  send_goal_options.goal_response_callback =
-    std::bind(&P2PGlobalPlanManager::global_planner_client_goal_response_callback, this, std::placeholders::_1);
-  send_goal_options.result_callback =
-    std::bind(&P2PGlobalPlanManager::global_planner_client_result_callback, this, std::placeholders::_1);
+  const auto generation = generation_;
+  send_goal_options.goal_response_callback = [this, generation](const auto& handle) {
+    std::unique_lock<std::mutex> lock(access_);
+    if (generation != generation_) return;
+    if (!handle) { failed_ = true; is_planning_ = false; global_path_.poses.clear(); }
+    global_planner_client_goal_response_callback(handle);
+  };
+  send_goal_options.result_callback = [this, generation](const auto& result) {
+    std::unique_lock<std::mutex> lock(access_);
+    if (generation != generation_) return;
+    global_planner_client_result_callback(result);
+  };
   
   is_planning_ = true;
   global_planner_client_ptr_->async_send_goal(goal_msg, send_goal_options);
@@ -162,7 +175,14 @@ void P2PGlobalPlanManager::global_planner_client_result_callback(const rclcpp_ac
       RCLCPP_ERROR(this->get_logger(), "Global Planner ---> %s: Unknown result code", global_planner_action_name_.c_str());
       break;
   }
-  global_path_ = result.result->path;
+  if (result.code != rclcpp_action::ResultCode::SUCCEEDED ||
+      !result.result || result.result->path.poses.empty()) {
+    failed_ = true;
+    global_path_.poses.clear();
+  } else {
+    global_path_ = result.result->path;
+    last_result_time_ = std::chrono::steady_clock::now();
+  }
   is_planning_ = false;
 }
 
@@ -176,6 +196,22 @@ bool P2PGlobalPlanManager::hasPlan(){
   std::unique_lock<std::mutex> lock(access_);
   if(!is_planning_ && !global_path_.poses.empty())
     return true;
+  return false;
+}
+
+bool P2PGlobalPlanManager::planningUnsafe(){
+  std::unique_lock<std::mutex> lock(access_);
+  const double age = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - last_result_time_).count();
+  if (failed_ || age > result_timeout_ ||
+      !global_planner_client_ptr_->action_server_is_ready()) {
+    RCLCPP_ERROR_THROTTLE(get_logger(), *clock_, 2000,
+        "Planning watchdog: failed=%d, result_age=%.3f s, timeout=%.3f s, server_ready=%d; discard cached path",
+        failed_, age, result_timeout_, global_planner_client_ptr_->action_server_is_ready());
+    failed_ = true;
+    global_path_.poses.clear();
+    return true;
+  }
   return false;
 }
 

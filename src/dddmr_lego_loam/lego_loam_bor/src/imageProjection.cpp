@@ -28,6 +28,8 @@
 
 #include <boost/circular_buffer.hpp>
 #include "imageProjection.h"
+#include <Eigen/Eigenvalues>
+#include <pcl/kdtree/kdtree_flann.h>
 
 using std::placeholders::_1;
 
@@ -212,6 +214,11 @@ ImageProjection::ImageProjection(std::string name, Channel<ProjectionOut>& outpu
 
   declare_parameter("imageProjection.ground_dz_tolerance", rclcpp::ParameterValue(0.1));
   this->get_parameter("imageProjection.ground_dz_tolerance", ground_dz_tolerance_);
+  ground_normal_check_ = declare_parameter<bool>("imageProjection.ground_normal_check", false);
+  ground_normal_radius_ = declare_parameter<double>("imageProjection.ground_normal_radius", 0.20);
+  ground_normal_min_neighbors_ = declare_parameter<int>("imageProjection.ground_normal_min_neighbors", 6);
+  if (!std::isfinite(ground_normal_radius_) || ground_normal_radius_ <= 0 || ground_normal_min_neighbors_ < 3)
+    throw std::invalid_argument("Invalid ground normal neighborhood parameters");
   RCLCPP_INFO(this->get_logger(), "imageProjection.ground_dz_tolerance: %.6f", ground_dz_tolerance_);
 
   declare_parameter("imageProjection.use_sensor_height_to_filter_out_ground", rclcpp::ParameterValue(false));
@@ -689,6 +696,55 @@ void ImageProjection::zPitchRollFeatureRemoval() {
   pcl::PointCloud<PointType> _full_cloud_no_pitch;
   pcl::transformPointCloud(*_full_cloud, _full_cloud_no_pitch, trans_lidar2horizontal_af3);
 
+  // A shallow two-point chord does not prove a horizontal surface: sparse
+  // projection bins on a wall can have the same height. Validate a 3-D plane
+  // around BOTH endpoints before classifying or interpolating ground.
+  pcl::PointCloud<PointType>::Ptr normal_support(new pcl::PointCloud<PointType>);
+  pcl::KdTreeFLANN<PointType> normal_tree;
+  std::vector<int> normal_valid(_full_cloud_no_pitch.size(), -1);
+  if (ground_normal_check_) {
+    pcl::PointCloud<PointType> raw_horizontal;
+    pcl::transformPointCloud(*_laser_cloud_in, raw_horizontal, trans_lidar2horizontal_af3);
+    for (const auto& pt : raw_horizontal)
+      if (std::isfinite(pt.x) && std::isfinite(pt.y) && std::isfinite(pt.z) &&
+          pt.getVector3fMap().norm() >= _minimum_detection_range &&
+          pt.getVector3fMap().norm() <= _maximum_detection_range)
+        normal_support->push_back(pt);
+    if (!normal_support->empty()) normal_tree.setInputCloud(normal_support);
+  }
+  const auto valid_ground_at = [&](const PointType& point) {
+    if (!ground_normal_check_) return true;
+    if (normal_support->empty()) return false;
+    std::vector<int> indices; std::vector<float> distances;
+    normal_tree.radiusSearch(point, ground_normal_radius_, indices, distances);
+    if (indices.size() < static_cast<size_t>(ground_normal_min_neighbors_)) return false;
+    // No fabricated floor through an unobserved gap (patch spacing is 0.1 m).
+    if (*std::min_element(distances.begin(), distances.end()) > 0.01f) return false;
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (int id : indices) mean += normal_support->points[id].getVector3fMap().cast<double>();
+    mean /= indices.size();
+    Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+    for (int id : indices) {
+      const Eigen::Vector3d d = normal_support->points[id].getVector3fMap().cast<double>() - mean;
+      covariance += d * d.transpose();
+    }
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
+    if (solver.info() != Eigen::Success) return false;
+    const auto values = solver.eigenvalues();
+    // Reject line-like or volumetric neighborhoods: their normals are unreliable.
+    if (values[2] <= 1e-10 || values[1] < 0.05 * values[2] ||
+        values[0] > 0.05 * values.sum()) return false;
+    const bool valid = std::abs(solver.eigenvectors()(2, 0)) >= std::cos(ground_slope_tolerance_);
+    return valid;
+  };
+  const auto valid_ground_normal = [&](size_t index) {
+    if (!ground_normal_check_) return true;
+    if (normal_valid[index] >= 0) return normal_valid[index] == 1;
+    const bool valid = valid_ground_at(_full_cloud_no_pitch[index]);
+    normal_valid[index] = valid ? 1 : 0;
+    return valid;
+  };
+
   // _ground_mat
   // -1, no valid info to check if ground of not
   //  0, initial value, after validation, means not ground
@@ -751,7 +807,8 @@ void ImageProjection::zPitchRollFeatureRemoval() {
 
       // zPitchRoll feature.  Ground must be nearly horizontal in either
       // direction; without abs(), every steep negative surface is accepted.
-      if (fabs(vertical_angle) <= 5 * DEG_TO_RAD) {
+      if (fabs(vertical_angle) <= 5 * DEG_TO_RAD &&
+          valid_ground_normal(lowerInd) && valid_ground_normal(upperInd)) {
         _ground_mat(i, j) = 1;
         _ground_mat(i + 1, j) = 1;
         _z_pitch_roll_decisive_feature_cloud->push_back(_full_cloud->points[upperInd]);
@@ -798,78 +855,37 @@ void ImageProjection::zPitchRollFeatureRemoval() {
 #endif
 
       if(in_ground_fov){
+        if (!valid_ground_normal(lowerInd) || !valid_ground_normal(upperInd)) {
+          do_patch = false;
+          _segmented_cloud_pure->push_back(_full_cloud->points[lowerInd]);
+          continue;
+        }
         PointType lowerInd_pt_no_pitch, upperInd_pt_no_pitch;
         PointType lowerInd_left_pt_no_pitch;
         PointType lowerInd_right_pt_no_pitch;
         bool valid_point = false;
         size_t horizontal_search_number = 20;
-        if(j<horizontal_search_number){
-          lowerInd_pt_no_pitch = _full_cloud_no_pitch[lowerInd];
-          for(int jj=1;jj<horizontal_search_number;jj++){
-            size_t compensateInd = 0;
-            if(lowerInd<jj){
-              compensateInd = _horizontal_scans+lowerInd-jj;
-            }
-            else{
-              compensateInd = lowerInd-jj;
-            }
-            lowerInd_left_pt_no_pitch = _full_cloud_no_pitch[compensateInd];
-            if(fabs(lowerInd_pt_no_pitch.y - lowerInd_left_pt_no_pitch.y)>0.05){
-              valid_point = true;
-              break;
-            }
-              
-          }
-          for(int jj=1;jj<horizontal_search_number;jj++){
-            lowerInd_right_pt_no_pitch = _full_cloud_no_pitch[lowerInd+jj];
-            if(fabs(lowerInd_pt_no_pitch.y - lowerInd_right_pt_no_pitch.y)>0.05){
-              valid_point = true;
-              break;
-            }
-              
+        lowerInd_pt_no_pitch = _full_cloud_no_pitch[lowerInd];
+        bool left_valid = false, right_valid = false;
+        for (int direction : {-1, 1}) {
+          for (size_t step = 1; step < horizontal_search_number; ++step) {
+            const size_t column = (static_cast<int>(j) + direction * static_cast<int>(step) +
+                                   static_cast<int>(_horizontal_scans)) % _horizontal_scans;
+            const size_t neighbor = i * _horizontal_scans + column;
+            const auto& pt = _full_cloud_no_pitch[neighbor];
+            if (pt.intensity == -1 || !std::isfinite(pt.x) ||
+                !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+            if (std::hypot(pt.x - lowerInd_pt_no_pitch.x,
+                           pt.y - lowerInd_pt_no_pitch.y) <= 0.05) continue;
+            if (direction < 0) { lowerInd_left_pt_no_pitch = pt; left_valid = true; }
+            else { lowerInd_right_pt_no_pitch = pt; right_valid = true; }
+            break;
           }
         }
-
-        else if(j>_horizontal_scans-horizontal_search_number-1){
-          lowerInd_pt_no_pitch = _full_cloud_no_pitch[lowerInd];
-          for(int jj=1;jj<horizontal_search_number;jj++){
-            lowerInd_left_pt_no_pitch = _full_cloud_no_pitch[lowerInd-jj];
-            if(fabs(lowerInd_pt_no_pitch.y - lowerInd_left_pt_no_pitch.y)>0.05){
-              valid_point = true;
-              break;
-            }
-          }
-          for(int jj=1;jj<horizontal_search_number;jj++){
-            size_t compensateInd = 0;
-            if(lowerInd+jj>_horizontal_scans-1){
-              compensateInd = (lowerInd+jj) - _horizontal_scans;
-            }
-            else{
-              compensateInd = lowerInd+jj;
-            }
-            lowerInd_right_pt_no_pitch = _full_cloud_no_pitch[compensateInd];
-            if(fabs(lowerInd_pt_no_pitch.y - lowerInd_right_pt_no_pitch.y)>0.05){
-              valid_point = true;
-              break;
-            }
-          }
-        }
-        else{
-          lowerInd_pt_no_pitch = _full_cloud_no_pitch[lowerInd];
-          for(int jj=1;jj<horizontal_search_number;jj++){
-            lowerInd_left_pt_no_pitch = _full_cloud_no_pitch[lowerInd-jj];
-            if(fabs(lowerInd_pt_no_pitch.y - lowerInd_left_pt_no_pitch.y)>0.05){
-              valid_point = true;
-              break;
-            }
-          }
-          for(int jj=1;jj<horizontal_search_number;jj++){
-            lowerInd_right_pt_no_pitch = _full_cloud_no_pitch[lowerInd+jj];
-            if(fabs(lowerInd_pt_no_pitch.y - lowerInd_right_pt_no_pitch.y)>0.05){
-              valid_point = true;
-              break;
-            } 
-          }
+        valid_point = left_valid && right_valid;
+        if (!valid_point) {
+          do_patch = false;
+          continue;
         }
         
         double dz_left = fabs(lowerInd_pt_no_pitch.z - lowerInd_left_pt_no_pitch.z);
@@ -928,7 +944,11 @@ void ImageProjection::zPitchRollFeatureRemoval() {
             a_pt.x = lowerInd_pt.x + dX*t;
             a_pt.y = lowerInd_pt.y + dY*t;
             a_pt.z = lowerInd_pt.z + dZ*t;
-            patched_ground_->push_back(a_pt);
+            PointType support_point;
+            support_point.x = lowerInd_pt_no_pitch.x + dXg*t;
+            support_point.y = lowerInd_pt_no_pitch.y + dYg*t;
+            support_point.z = lowerInd_pt_no_pitch.z + dZg*t;
+            if (valid_ground_at(support_point)) patched_ground_->push_back(a_pt);
           }
           PointType a_pt;
           a_pt.intensity = 0.0;
