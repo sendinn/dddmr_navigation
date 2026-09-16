@@ -158,6 +158,7 @@ class ImageProjection : public rclcpp::Node
     int ground_normal_min_neighbors_;
     
     bool patch_first_ring_to_baselink_;
+    bool project_walls_to_ground_;
 
     double ground_fov_bottom_;
     double ground_fov_top_;

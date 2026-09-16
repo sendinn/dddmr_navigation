@@ -29,6 +29,7 @@
 * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #include <perception_3d/static_layer.h>
+#include <stdexcept>
 
 PLUGINLIB_EXPORT_CLASS(perception_3d::StaticLayer, perception_3d::Sensor)
 
@@ -77,9 +78,39 @@ void StaticLayer::onInitialize()
   node_->get_parameter(name_ + ".intensity_search_punish_weight", intensity_search_punish_weight_);
   RCLCPP_INFO(node_->get_logger().get_child(name_), "intensity_search_punish_weight: %.2f", intensity_search_punish_weight_);    
 
+  node_->declare_parameter(name_ + ".static_obstacle_min_height", rclcpp::ParameterValue(0.1));
+  node_->get_parameter(name_ + ".static_obstacle_min_height", static_obstacle_min_height_);
+  node_->declare_parameter(name_ + ".static_obstacle_max_height", rclcpp::ParameterValue(1.0));
+  node_->get_parameter(name_ + ".static_obstacle_max_height", static_obstacle_max_height_);
+  node_->declare_parameter(name_ + ".static_obstacle_half_x", rclcpp::ParameterValue(0.5));
+  node_->get_parameter(name_ + ".static_obstacle_half_x", static_obstacle_half_x_);
+  node_->declare_parameter(name_ + ".static_obstacle_half_y", rclcpp::ParameterValue(0.5));
+  node_->get_parameter(name_ + ".static_obstacle_half_y", static_obstacle_half_y_);
+  node_->declare_parameter(name_ + ".static_obstacle_min_points", rclcpp::ParameterValue(11));
+  node_->get_parameter(name_ + ".static_obstacle_min_points", static_obstacle_min_points_);
+  node_->declare_parameter(name_ + ".static_obstacle_value", rclcpp::ParameterValue(0.25));
+  node_->get_parameter(name_ + ".static_obstacle_value", static_obstacle_value_);
+  node_->declare_parameter(name_ + ".static_ground_min_neighbors", rclcpp::ParameterValue(5));
+  node_->get_parameter(name_ + ".static_ground_min_neighbors", static_ground_min_neighbors_);
   node_->declare_parameter(name_ + ".static_imposing_radius", rclcpp::ParameterValue(0.25));
   node_->get_parameter(name_ + ".static_imposing_radius", static_imposing_radius_);
-  RCLCPP_INFO(node_->get_logger().get_child(name_), "static_imposing_radius: %.2f", static_imposing_radius_);    
+  if (!std::isfinite(static_imposing_radius_) || static_imposing_radius_ <= 0 ||
+      !std::isfinite(static_obstacle_min_height_) || static_obstacle_min_height_ < 0 ||
+      !std::isfinite(static_obstacle_max_height_) ||
+      static_obstacle_max_height_ <= static_obstacle_min_height_ ||
+      !std::isfinite(static_obstacle_half_x_) || static_obstacle_half_x_ <= 0 ||
+      !std::isfinite(static_obstacle_half_y_) || static_obstacle_half_y_ <= 0 ||
+      !std::isfinite(static_obstacle_value_) || static_obstacle_value_ < 0 ||
+      static_obstacle_value_ >= gbl_utils_->getInscribedRadius() ||
+      static_obstacle_min_points_ < 1 || static_ground_min_neighbors_ < 3) {
+    throw std::invalid_argument("Invalid static obstacle thresholds; value must remain below inscribed radius");
+  }
+  RCLCPP_INFO(node_->get_logger().get_child(name_), "static_imposing_radius: %.2f", static_imposing_radius_);
+  RCLCPP_INFO(node_->get_logger().get_child(name_),
+      "Static count rule: height=[%.3f, %.3f], half_xy=[%.3f, %.3f], min_points=%d, value=%.3f, ground_neighbors=%d",
+      static_obstacle_min_height_, static_obstacle_max_height_,
+      static_obstacle_half_x_, static_obstacle_half_y_, static_obstacle_min_points_,
+      static_obstacle_value_, static_ground_min_neighbors_);
 
   node_->declare_parameter(name_ + ".is_local_planner", rclcpp::ParameterValue(false));
   node_->get_parameter(name_ + ".is_local_planner", is_local_planner_);
@@ -346,7 +377,7 @@ void StaticLayer::radiusSearchConnection(){
     float max_radius = intensity_search_radius_; 
     int reject_threshold = 0;
     //@ consider this scenario to be boundary of ground
-    if(nn_pc->points.size()<5){
+    if(nn_pc->points.size()<static_cast<size_t>(static_ground_min_neighbors_)){
       weight = 1000;
     }
     else{
@@ -397,19 +428,19 @@ void StaticLayer::radiusSearchConnection(){
       pcl::PassThrough<pcl::PointXYZI> pass;
       pass.setInputCloud (pcl_z_axes);
       pass.setFilterFieldName ("z");
-      pass.setFilterLimits (pcl_node.z+0.1, pcl_node.z+1.0);
+      pass.setFilterLimits (pcl_node.z+static_obstacle_min_height_, pcl_node.z+static_obstacle_max_height_);
       pass.filter (*pcl_z_axes);
       pass.setInputCloud (pcl_z_axes);
       pass.setFilterFieldName ("x");
-      pass.setFilterLimits (pcl_node.x-0.5, pcl_node.x+0.5);
+      pass.setFilterLimits (pcl_node.x-static_obstacle_half_x_, pcl_node.x+static_obstacle_half_x_);
       pass.filter (*pcl_z_axes);
       pass.setInputCloud (pcl_z_axes);
       pass.setFilterFieldName ("y");
-      pass.setFilterLimits (pcl_node.y-0.5, pcl_node.y+0.5);
+      pass.setFilterLimits (pcl_node.y-static_obstacle_half_y_, pcl_node.y+static_obstacle_half_y_);
       pass.filter (*pcl_z_axes);
       
-      if(pcl_z_axes->points.size()>10){
-        dGraph_.setValue(index_cnt, 0.25);
+      if(pcl_z_axes->points.size()>=static_cast<size_t>(static_obstacle_min_points_)){
+        dGraph_.setValue(index_cnt, static_obstacle_value_);
       }  
     }
     shared_data_->sGraph_ptr_->setPenality(index_cnt, intensity_penality);

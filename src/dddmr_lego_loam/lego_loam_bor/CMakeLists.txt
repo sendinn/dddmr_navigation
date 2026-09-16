@@ -493,6 +493,13 @@ if(TEST_ENABLED)
 endif()
 
 # --- Everything CI/CD test finish here ---
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(wall_ground_projection_test test/wall_ground_projection_test.cpp)
+  target_link_libraries(wall_ground_projection_test ${PCL_LIBRARIES})
+  target_compile_options(wall_ground_projection_test PRIVATE -UNDEBUG)
+  add_test(NAME wall_ground_projection_test COMMAND wall_ground_projection_test)
+endif()
 
 ament_export_include_directories(include)
 ament_export_libraries(opt_icp_gn image_projection feature_association map_optimization lego_loam_map_visualization pose_graph_editor interactive_pose_graph_editor)

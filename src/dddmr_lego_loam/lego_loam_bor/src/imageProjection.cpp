@@ -28,6 +28,7 @@
 
 #include <boost/circular_buffer.hpp>
 #include "imageProjection.h"
+#include "wall_ground_projection.h"
 #include <Eigen/Eigenvalues>
 #include <pcl/kdtree/kdtree_flann.h>
 
@@ -215,6 +216,9 @@ ImageProjection::ImageProjection(std::string name, Channel<ProjectionOut>& outpu
   declare_parameter("imageProjection.ground_dz_tolerance", rclcpp::ParameterValue(0.1));
   this->get_parameter("imageProjection.ground_dz_tolerance", ground_dz_tolerance_);
   ground_normal_check_ = declare_parameter<bool>("imageProjection.ground_normal_check", false);
+  project_walls_to_ground_ = declare_parameter<bool>("imageProjection.project_walls_to_ground", false);
+  if (project_walls_to_ground_)
+    RCLCPP_WARN(get_logger(), "Experimental wall projection adds inferred ground to saved maps; validate before navigation");
   ground_normal_radius_ = declare_parameter<double>("imageProjection.ground_normal_radius", 0.20);
   ground_normal_min_neighbors_ = declare_parameter<int>("imageProjection.ground_normal_min_neighbors", 6);
   if (!std::isfinite(ground_normal_radius_) || ground_normal_radius_ <= 0 || ground_normal_min_neighbors_ < 3)
@@ -996,6 +1000,17 @@ void ImageProjection::zPitchRollFeatureRemoval() {
     }
   }
 
+  if (project_walls_to_ground_) {
+    pcl::PointCloud<PointType> ground_horizontal, observed_horizontal;
+    pcl::transformPointCloud(*patched_ground_, ground_horizontal, trans_lidar2horizontal_af3);
+    pcl::transformPointCloud(*_segmented_cloud_pure, observed_horizontal, trans_lidar2horizontal_af3);
+    auto projected = wall_ground_projection::project(observed_horizontal, ground_horizontal);
+    pcl::PointCloud<PointType> projected_sensor;
+    pcl::transformPointCloud(projected, projected_sensor, trans_lidar2horizontal_af3.inverse());
+    *patched_ground_ += projected_sensor;
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Experimental wall-to-ground projection: added %zu points before voxel filtering", projected.size());
+  }
   patched_ground_->is_dense = false;
   patched_ground_edge_->is_dense = false;
   std::vector<int> tmp_indices, tmp_indices2;
@@ -1176,7 +1191,10 @@ void ImageProjection::publishClouds() {
   };
 
   //PublishCloud(_pub_outlier_cloud, _outlier_cloud);
-  //PublishCloud(_pub_segmented_cloud, _segmented_cloud);
+  // Optional debug view; keep the internal feature-extraction cloud unchanged.
+  if (_pub_segmented_cloud->get_subscription_count() != 0) {
+    PublishCloud(_pub_segmented_cloud, _segmented_cloud);
+  }
   PublishCloud(_pub_ground_cloud, ds_patched_ground_);
   PublishCloud(_pub_segmented_cloud_pure, _segmented_cloud_pure);
   //PublishCloud(_pub_full_info_cloud, _full_info_cloud);
