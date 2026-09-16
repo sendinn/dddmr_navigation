@@ -171,6 +171,7 @@ void MCL3dlNode::cbOdom(const nav_msgs::msg::Odometry::SharedPtr msg){
                 msg->pose.pose.orientation.w),
           time_seconds);
 
+  if (!odom_history_.push(odom_)) return;
   odom_header_ = msg->header;
   odom_trans_.header = msg->header;
   odom_trans_.child_frame_id = msg->child_frame_id;
@@ -199,12 +200,27 @@ void MCL3dlNode::cbOdom(const nav_msgs::msg::Odometry::SharedPtr msg){
 
 void MCL3dlNode::updateFromLatestFeatures()
 {
-  if (!has_odom_) return;
-  double dx = odom_.pos_.x_ - odom_prev_.pos_.x_;
-  double dy = odom_.pos_.y_ - odom_prev_.pos_.y_;
-  double dz = odom_.pos_.z_ - odom_prev_.pos_.z_;
+  if (!has_odom_ || pcl_segmentations_.empty()) return;
+  const int64_t scan_ns = rclcpp::Time(laser_header_.stamp).nanoseconds();
+  // Every measurement must consume a distinct scan, including while moving.
+  if (scan_ns <= last_measurement_scan_ns_) return;
+  const double scan_time = laser_header_.stamp.sec + laser_header_.stamp.nanosec * 1e-9;
+  State6DOF aligned_odom;
+  if (!odom_history_.sample(scan_time, aligned_odom)) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *clock_, 3000,
+      "Waiting for odometry bracketing lidar stamp; no extrapolated MCL update.");
+    return;
+  }
+  if (!measurement_odom_initialized_) {
+    odom_prev_ = aligned_odom;
+    odom_last_ = rclcpp::Time(laser_header_.stamp);
+    measurement_odom_initialized_ = true;
+  }
+  double dx = aligned_odom.pos_.x_ - odom_prev_.pos_.x_;
+  double dy = aligned_odom.pos_.y_ - odom_prev_.pos_.y_;
+  double dz = aligned_odom.pos_.z_ - odom_prev_.pos_.z_;
 
-  tf2::Quaternion q_odom(odom_.rot_.x_, odom_.rot_.y_, odom_.rot_.z_, odom_.rot_.w_);
+  tf2::Quaternion q_odom(aligned_odom.rot_.x_, aligned_odom.rot_.y_, aligned_odom.rot_.z_, aligned_odom.rot_.w_);
   tf2::Quaternion q_odom_prev_(odom_prev_.rot_.x_, odom_prev_.rot_.y_, odom_prev_.rot_.z_, odom_prev_.rot_.w_);
 
   double roll_odom, pitch_odom, yaw_odom;
@@ -216,9 +232,8 @@ void MCL3dlNode::updateFromLatestFeatures()
   double droll = roll_odom - roll_odom_prev;
   double dpitch = pitch_odom - pitch_odom_prev;
   double dyaw = yaw_odom - yaw_odom_prev;
-  rclcpp::Time msg_time(odom_header_.stamp);
+  rclcpp::Time msg_time(laser_header_.stamp);
 
-  const int64_t scan_ns = rclcpp::Time(laser_header_.stamp).nanoseconds();
   const bool stationary_update = stationary_update_interval_ > 0.0 &&
       scan_ns > last_measurement_scan_ns_ &&
       (msg_time - odom_last_).seconds() >= stationary_update_interval_;
@@ -227,14 +242,15 @@ void MCL3dlNode::updateFromLatestFeatures()
       return;
     }
 
-    motion_prediction_model_->setOdoms(odom_prev_, odom_);
+    motion_prediction_model_->setOdoms(odom_prev_, aligned_odom);
     auto prediction_func = [this](State6DOF& s)
     {
       motion_prediction_model_->predict(s);
     };
     pf_->predict(prediction_func);
     odom_last_ = msg_time;
-    odom_prev_ = odom_;
+    odom_prev_ = aligned_odom;
+    measurement_odom_ = aligned_odom;
     
     last_measurement_scan_ns_ = scan_ns;
     measure(pcl_segmentations_);
@@ -600,8 +616,8 @@ void MCL3dlNode::measure(std::map<std::string, pcl::PointCloud<mcl_3dl::pcl_t>::
 
   Vec3 map_pos;
   Quat map_rot;
-  map_pos = e.pos_ - e.rot_ * odom_.rot_.inv() * odom_.pos_;
-  map_rot = e.rot_ * odom_.rot_.inv();
+  map_pos = e.pos_ - e.rot_ * measurement_odom_.rot_.inv() * measurement_odom_.pos_;
+  map_rot = e.rot_ * measurement_odom_.rot_.inv();
 
   bool jump = false;
   if (static_cast<int>(pf_->getParticleSize()) > params_->num_particles_)
@@ -785,6 +801,9 @@ void MCL3dlNode::cbPosition(const geometry_msgs::msg::PoseWithCovarianceStamped:
   }
 
   std::unique_lock<std::mutex> lock(protect_measure_in_odomcb_);
+  measurement_odom_initialized_ = false;
+  pcl_segmentations_.clear();
+  last_measurement_scan_ns_ = rclcpp::Time(odom_header_.stamp).nanoseconds();
   sub_maps_->setInitialPose(*msg);
   while(rclcpp::ok() && !sub_maps_->isWarmUpReady()){
 

@@ -85,6 +85,7 @@
 #include <mcl_3dl/pf.h>
 #include <mcl_3dl/quat.h>
 #include <mcl_3dl/state_6dof.h>
+#include <mcl_3dl/odom_history.h>
 #include <mcl_3dl/vec3.h>
 
 /*sync topics from lego loam from featureAssociation node.*/
@@ -236,6 +237,9 @@ class MCL3dlNode : public rclcpp::Node
     std_msgs::msg::Header odom_header_;
     State6DOF odom_;
     State6DOF odom_prev_;
+    State6DOF measurement_odom_;
+    OdomHistory odom_history_;
+    bool measurement_odom_initialized_ = false;
     State6DOF state_prev_;
     
     MotionPredictionModelBase::Ptr motion_prediction_model_;
