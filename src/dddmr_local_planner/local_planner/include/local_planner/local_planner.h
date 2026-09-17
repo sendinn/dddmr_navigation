@@ -130,6 +130,7 @@ class Local_Planner : public rclcpp::Node {
       rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_aggregate_observation_;
       rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_prune_plan_;
       rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_accepted_trajectory_pose_array_;
+      rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_local_trajectory_markers_;
       rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_best_trajectory_pose_;
       rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_trajectory_pose_array_;
       //ros::Publisher pub_pc_normal_;

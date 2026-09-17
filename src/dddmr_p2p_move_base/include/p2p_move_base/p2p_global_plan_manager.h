@@ -97,6 +97,7 @@ public:
   void setGoal(const geometry_msgs::msg::PoseStamped& goal);
   void resume();
   void stop();
+  void pause();
   bool hasPlan();
   bool planningUnsafe();
   void copyPlan(std::vector<geometry_msgs::msg::PoseStamped>& plan);

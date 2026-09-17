@@ -94,6 +94,14 @@ void P2PGlobalPlanManager::resume(){
   RCLCPP_INFO(this->get_logger(), "Global plan manager is resumed");
 }
 
+void P2PGlobalPlanManager::pause(){
+  std::unique_lock<std::mutex> lock(access_);
+  ++generation_;  // Discard outstanding results; no stop request can race the restart.
+  loop_timer_->cancel();
+  global_path_.poses.clear();
+  is_planning_ = false;
+}
+
 void P2PGlobalPlanManager::stop(){
   std::unique_lock<std::mutex> lock(access_);
   ++generation_;

@@ -29,6 +29,7 @@
 * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 /*Debug*/
+#include <p2p_move_base/localization_recovery.h>
 #include <chrono>
 #include <atomic>
 #include <mutex>
@@ -113,9 +114,13 @@ class P2PMoveBase : public rclcpp::Node {
     rclcpp_action::Client<dddmr_sys_core::action::RecoveryBehaviors>::SharedPtr recovery_behaviors_client_ptr_;
     void recovery_behaviors_client_goal_response_callback(const rclcpp_action::ClientGoalHandle<dddmr_sys_core::action::RecoveryBehaviors>::SharedPtr & goal_handle);
     void recovery_behaviors_client_result_callback(const rclcpp_action::ClientGoalHandle<dddmr_sys_core::action::RecoveryBehaviors>::WrappedResult & result);
-    bool is_recoverying_;
+    std::atomic<bool> is_recoverying_{false};
     bool enable_rotate_recovery_ = true;
     double localization_timeout_ = 0.0;
+    double localization_resume_stable_time_ = 1.0;
+    LocalizationRecovery localization_recovery_;
+    bool localization_paused_ = false;
+    bool localization_replanning_ = false;
     std::atomic<int64_t> localization_valid_until_{0};
     std::mutex localization_diagnostics_mutex_;
     int64_t localization_stamp_ns_ = 0;

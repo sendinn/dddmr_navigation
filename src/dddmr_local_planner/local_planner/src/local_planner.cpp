@@ -113,6 +113,7 @@ void Local_Planner::initial(
   pub_aggregate_observation_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("aggregated_pc", 1);  
   pub_prune_plan_ = this->create_publisher<nav_msgs::msg::Path>("prune_plan", 1);
   pub_accepted_trajectory_pose_array_ = this->create_publisher<geometry_msgs::msg::PoseArray>("accepted_trajectory", 1);
+  pub_local_trajectory_markers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("local_trajectory_candidates", 1);
   pub_best_trajectory_pose_ = this->create_publisher<geometry_msgs::msg::PoseArray>("best_trajectory", 2);
   pub_trajectory_pose_array_ = this->create_publisher<geometry_msgs::msg::PoseArray>("trajectory", 2);
   //pub_pc_normal_ = pnh_.advertise<visualization_msgs::MarkerArray>("normal_marker", 2, true);
@@ -311,7 +312,7 @@ bool Local_Planner::isGoalHeadingAligned(){
   
   RCLCPP_DEBUG(this->get_logger().get_child(name_), "Heading difference to goal is %.2f", yaw);
 
-  if(fabs(yaw) < yaw_goal_tolerance_)
+  if(fabs(yaw) <= yaw_goal_tolerance_)
     return true;
   else
     return false;
@@ -325,9 +326,9 @@ bool Local_Planner::isGoalReached(){
   final_pose = global_plan_.back();
   double dx = trans_gbl2b_.transform.translation.x - final_pose.pose.position.x;
   double dy = trans_gbl2b_.transform.translation.y - final_pose.pose.position.y;
-  double dz = trans_gbl2b_.transform.translation.z - final_pose.pose.position.z;
-  double distance = sqrt(dx*dx + dy*dy + dz*dz);
-  if(xy_goal_tolerance_>distance)
+  // Goal is projected onto the ground; base_link height must not consume XY tolerance.
+  double distance = std::hypot(dx, dy);
+  if(distance <= xy_goal_tolerance_)
     return true;
   else
     return false;
@@ -541,6 +542,38 @@ void Local_Planner::getBestTrajectory(std::string traj_gen_name, base_trajectory
   best_pose_arr.header.frame_id = perception_3d_ros_->getGlobalUtils()->getGblFrame();
   best_pose_arr.header.stamp = clock_->now();
   pub_best_trajectory_pose_->publish(best_pose_arr);
+
+  // A complete snapshot with explicit boundaries; never concatenate trajectories.
+  visualization_msgs::msg::MarkerArray markers;
+  visualization_msgs::msg::Marker clear;
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+  markers.markers.push_back(clear);
+  int marker_id = 0;
+  auto append_marker = [&](const base_trajectory::Trajectory& trajectory,
+                           const std::string& kind) {
+    if (trajectory.getPosesSize() < 2) return;
+    visualization_msgs::msg::Marker marker;
+    marker.header = best_pose_arr.header;
+    marker.ns = kind;
+    marker.id = marker_id++;
+    marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = kind == "best" ? 0.035 : 0.01;
+    marker.color.a = kind == "best" ? 1.0 : 0.4;
+    marker.color.r = kind == "accepted" ? 0.2 : 1.0;
+    marker.color.g = kind == "rejected" ? 0.3 : 0.8;
+    marker.color.b = kind == "accepted" ? 1.0 : 0.2;
+    marker.lifetime.sec = 1;
+    for (unsigned int i = 0; i < trajectory.getPosesSize(); ++i)
+      marker.points.push_back(trajectory.getPose(i).pose.position);
+    markers.markers.push_back(marker);
+  };
+  for (const auto& trajectory : *trajectories_)
+    append_marker(trajectory, trajectory.cost_ >= 0 ? "accepted" : "rejected");
+  if (best_traj.cost_ >= 0) append_marker(best_traj, "best");
+  pub_local_trajectory_markers_->publish(markers);
+
 
 }
 

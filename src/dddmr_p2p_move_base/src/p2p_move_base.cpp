@@ -38,6 +38,9 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
   name_ = name;
   clock_ = this->get_clock();
   localization_timeout_ = declare_parameter<double>("localization_timeout", 0.0);
+  localization_resume_stable_time_ = declare_parameter<double>("localization_resume_stable_time", 1.0);
+  if (!std::isfinite(localization_resume_stable_time_) || localization_resume_stable_time_ <= 0.0)
+    throw std::invalid_argument("localization_resume_stable_time must be positive");
   const double xy_limit = declare_parameter<double>("localization_xy_std_max", 0.15);
   const double yaw_limit = declare_parameter<double>("localization_yaw_std_max", 0.20);
   localization_xy_limit_ = xy_limit;
@@ -62,6 +65,7 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
           msg->header.stamp.sec > 0 && age >= 0 && age < localization_timeout_;
         const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
+        localization_recovery_.observe(valid, now, localization_stamp_ns_, localization_valid_until_.load());
         localization_valid_until_.store(valid ? now + static_cast<int64_t>(
             (localization_timeout_ - age) * 1e9) : 0);
       });
@@ -269,6 +273,8 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
   //@ the rclcpp::Time initial are all done in FSM class
   STATE_->initialParams(LP_->getGlobalPose(), clock_->now());
   progress_control_started_ = false;
+  localization_paused_ = false;
+  localization_replanning_ = false;
   STATE_->current_goal_ = move_base_goal->target_pose;
   GPM_->setGoal(STATE_->current_goal_);
   GPM_->resume();
@@ -277,7 +283,7 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
 
     if(!goal_handle->is_active()){
       
-      if(STATE_->isCurrentDecision("d_recovery_waitdone")){
+      if(is_recoverying_.load()){
         RCLCPP_INFO(this->get_logger(), "P2P is in recovery state, cancel recovery behaviors.");
         recovery_behaviors_client_ptr_->async_cancel_all_goals();
       }
@@ -290,7 +296,7 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
 
     if(goal_handle->is_canceling()){
 
-      if(STATE_->isCurrentDecision("d_recovery_waitdone")){
+      if(is_recoverying_.load()){
         RCLCPP_INFO(this->get_logger(), "P2P is in recovery state, cancel recovery behaviors.");
         recovery_behaviors_client_ptr_->async_cancel_all_goals();
       }
@@ -329,10 +335,13 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
     const auto steady_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     bool localization_invalid = false;
+    bool localization_recovered = false;
     if (localization_timeout_ > 0.0) {
       std::lock_guard<std::mutex> guard(localization_diagnostics_mutex_);
       localization_invalid = steady_now >= localization_valid_until_.load();
-      if (localization_invalid) {
+      localization_recovered = localization_recovery_.ready(
+        steady_now, localization_valid_until_.load(), localization_resume_stable_time_);
+      if (localization_invalid && !localization_paused_) {
         const double age = localization_stamp_ns_ > 0 ?
           (clock_->now().nanoseconds() - localization_stamp_ns_) * 1e-9 : -1.0;
         RCLCPP_ERROR(get_logger(),
@@ -346,11 +355,34 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
     }
     if (localization_invalid) {
       publishZeroVelocity();
-      recovery_behaviors_client_ptr_->async_cancel_all_goals();
-      RCLCPP_ERROR(get_logger(), "Localization absent, stale or uncertain: aborting navigation; a new goal is required.");
-      auto result = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>();
-      goal_handle->abort(result);
-      return true;
+      // Repeat cancellation until a pending recovery request has also stopped.
+      if (is_recoverying_.load()) recovery_behaviors_client_ptr_->async_cancel_all_goals();
+      if (!localization_paused_) {
+        localization_paused_ = true;
+        GPM_->pause();
+        recovery_behaviors_client_ptr_->async_cancel_all_goals();
+        RCLCPP_WARN(get_logger(), "Localization paused: retaining goal; waiting for stable localization before replanning.");
+      }
+      return false;
+    }
+    if (localization_paused_) {
+      publishZeroVelocity();
+      if (is_recoverying_.load()) {
+        recovery_behaviors_client_ptr_->async_cancel_all_goals();
+        return false;
+      }
+      if (!localization_recovered) return false;
+      localization_replanning_ = true;
+      localization_paused_ = false;
+      STATE_->initialParams(LP_->getGlobalPose(), clock_->now());
+      progress_control_started_ = false;
+      heading_stopped_samples_ = 0;
+      // A new request stamp forces a full plan even though the destination is unchanged.
+      STATE_->current_goal_.header.stamp = clock_->now();
+      GPM_->setGoal(STATE_->current_goal_);
+      GPM_->resume();
+      RCLCPP_INFO(get_logger(), "Localization recovered: replanning retained goal from current pose.");
+      return false;
     }
     if (GPM_->planningUnsafe()) {
       publishZeroVelocity();
@@ -393,6 +425,12 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       std::vector<geometry_msgs::msg::PoseStamped> plan;
       if(GPM_->hasPlan()){
         GPM_->copyPlan(plan);
+        if (localization_replanning_ && plan.size() < 3) {
+          publishZeroVelocity();
+          RCLCPP_ERROR(get_logger(), "Planning unavailable/stale: resumed plan has fewer than three points.");
+          goal_handle->abort(std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>());
+          return true;
+        }
         //if the planner fails or returns a zero length plan, planning failed
         if(plan.empty()){
           RCLCPP_DEBUG(this->get_logger(), "Failed to find a plan to point (%.2f, %.2f, %.2f)", 
@@ -404,6 +442,10 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
               plan.back().pose.position.x, plan.back().pose.position.y, plan.back().pose.position.z);
           STATE_->last_valid_plan_ = clock_->now();
           LP_->setPlan(plan);
+          if (localization_replanning_) {
+            localization_replanning_ = false;
+            RCLCPP_INFO(get_logger(), "Localization resume plan ready: continuing retained goal.");
+          }
           STATE_->setDecision("d_align_heading");  
         }
       }
@@ -536,6 +578,13 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
     }
 
     else if(STATE_->isCurrentDecision("d_align_goal_heading")){
+      // Turning can move the body outside the position tolerance. Both conditions
+      // must hold at completion, rather than latching an earlier position check.
+      if (!LP_->isGoalReached()) {
+        publishZeroVelocity();
+        STATE_->setDecision("d_controlling");
+        return false;
+      }
       if(LP_->isGoalHeadingAligned()){
         RCLCPP_INFO(this->get_logger(), "Goal reach.");
         auto result = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>();
@@ -885,6 +934,7 @@ void P2PMoveBase::startRecoveryBehaviors(std::string behavior_name){
 void P2PMoveBase::recovery_behaviors_client_goal_response_callback(const rclcpp_action::ClientGoalHandle<dddmr_sys_core::action::RecoveryBehaviors>::SharedPtr & goal_handle)
 {
   if (!goal_handle) {
+    is_recoverying_ = false;
     RCLCPP_ERROR(this->get_logger(), "Goal was rejected by recovery behaviors server");
   } else {
     RCLCPP_INFO(this->get_logger(), "Goal accepted by recovery behaviors server, waiting for result");

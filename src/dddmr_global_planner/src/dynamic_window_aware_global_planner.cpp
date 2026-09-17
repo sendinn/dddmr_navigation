@@ -114,7 +114,9 @@ DWA_GlobalPlanner::~DWA_GlobalPlanner(){
 }
 
 bool DWA_GlobalPlanner::isNewGoal(){
-  if(new_goal_.pose.position.x==current_goal_.pose.position.x && 
+  if(new_goal_.header.stamp == current_goal_.header.stamp &&
+      new_goal_.header.frame_id == current_goal_.header.frame_id &&
+      new_goal_.pose.position.x==current_goal_.pose.position.x &&
       new_goal_.pose.position.y==current_goal_.pose.position.y && 
         new_goal_.pose.position.z==current_goal_.pose.position.z && 
           new_goal_.pose.orientation.x==current_goal_.pose.orientation.x && 

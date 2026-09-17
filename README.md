@@ -911,7 +911,11 @@ Astrall 配置启用两个本地新增开关（通用代码默认关闭）：
 
 - Astrall 的局部静态层启用 `map.collision_observation: true`，将静态 `mapcloud` 的快照汇入局部碰撞评分，不再只依靠实时点云。地图和地面未初始化时禁止通过感知就绪检查。
 - 局部雷达过滤后的实时障碍点少于 5 个时禁止运动；汇总碰撞点不足 5 个也拒绝候选。静态地图不能替代实时感知就绪。雷达同时检查处理间隔和输入消息年龄，局部评分读取加锁复制的点云快照。这是保守停车策略：无障碍的空旷环境也可能停车，点数达到阈值仍不代表盲区安全。
-- `p2p_move_base.localization_timeout: 0.5` 要求最近通过匹配的 `mcl_pose` 足够新鲜，同时检查 XY/yaw 方差。失效后发零速度、中止目标并取消恢复行为；定位恢复不会自动恢复该目标。门禁在控制循环检查，不等同于独立硬件急停。
+- Astrall 到达判定：水平距离 `sqrt((x-x_goal)^2 + (y-y_goal)^2) ≤ 0.5 m`，且机身与目标的最短航向偏差 `≤ 15°`（`0.2617993877991494 rad`），同时满足才返回成功并发零速度。对应 `local_planner.xy_goal_tolerance` / `yaw_goal_tolerance`。不把机身离地高度算入 XY 距离；最终转向时重新检查距离，若移出范围则继续靠近。
+- `p2p_move_base.localization_timeout: 1.0` 要求最近通过匹配的 `mcl_pose` 足够新鲜，同时分别检查 X、Y、yaw 方差。失效后持续发零速度，暂停路径查询、作废未完成的规划结果并取消恢复行为，但保留原导航目标。MCL 节点继续点云匹配和定位更新。
+- `p2p_move_base.localization_resume_stable_time: 1.0`：有效定位连续保持至少 1 秒、期间收到不同时间戳的新定位帧且恢复行为已结束，自动从当前位姿重新进行完整全局规划。任何超限帧或数据过期都会重新计时。新路径就绪后才重新对准航向并交给局部规划器继续行走；不会直接沿暂停前的缓存路径续走。
+- 定位一直不恢复就一直停车等待，可取消目标或结束导航；取消后不会自动恢复。自动续走仅针对定位暂时失效，规划失败、规划结果过期等其他故障仍中止任务。WebUI 显示“已停车等待定位 → 正在重新规划 → 新路线已就绪”，等待和重规划期间清除旧全局路径及局部候选显示。
+- 这里继续的是现有粒子滤波匹配，不会自动重置粒子或进行全地图搜索；初始位置错误时仍可能需要手动设置重定位。门禁在控制循环检查，不等同于独立硬件急停。
 - 执行期 `localization_xy_std_max: 0.15`、`localization_yaw_std_max: 0.20` 独立于 WebUI 的准入门限；Web 修改门限不会自动修改这两个执行期参数。
 
 仍待确认：碰撞盒必须覆盖真实机身/腿部的运动包络；当前 `base_link` 下 `z=0～0.6 m` 未经尺寸验收。路径阻塞检查的 `check_radius` 是路径点周围的三维球，不是机器人外形；Web 中过小的距离不能提供全身保护。上述修改未调整其数值，也未验证真实制动距离或 Odin1 盲区覆盖。不要将编译通过当作防撞验收通过。
@@ -1161,3 +1165,573 @@ Astrall 导航的全局静态层增加 `static_support_check: true`，`static_su
 新增 `planar_constraint_test` 检查高度/倾角约束、X/Y/yaw 保留和重置高度；测试与编译不代表实机对齐已通过。
 
 <!-- 本地补充结束 -->
+
+## 17. Astrall / Odin1 点云处理全流程与参数影响
+
+本节依据当前本地源码整理，描述 Astrall 集成的实际处理链，不代表所有上游版本。建图配置为 [odin1_mapping.yaml](../robot/astrall/astrall_dddmr_bringup/config/odin1_mapping.yaml)，导航配置为 [odin1_navigation.yaml](../robot/astrall/astrall_dddmr_bringup/config/odin1_navigation.yaml)。WebUI 会生成运行 YAML 并覆盖部分参数；模板、安装版本和实际启动参数应一起核对。修改建图模板不会改变正在运行的导航，也不会追溯修改已有地图。
+
+### 17.1 从设备到实时特征的流程图
+
+```mermaid
+flowchart TD
+    U0["设备 UDP 6100：已配准的世界坐标点云<br/>XYZ × 1e-4 → 米"]
+    U1["设备 UDP 6101：雷达位姿<br/>XYZ × 1e-6 → 米；四元数归一化"]
+    O["/astrall/lidar/points_odom<br/>设备世界坐标点云"]
+    L["/astrall/lidar/odometry<br/>雷达在 odom 中的位姿"]
+    B["/astrall/base/odometry<br/>结合安装外参得到机身位姿"]
+    S["/astrall/lidar/points：lidar_link<br/>/astrall/lidar/points_base：base_link"]
+    P["ImageProjection<br/>有效性及距离过滤、可选拼帧、投影到行列网格"]
+    G["地面处理<br/>相邻行、角度范围、法向、坡度、邻域高度等检查"]
+    PG["patched_ground → 体素降采样<br/>/ground_cloud：包含受约束补点的地面"]
+    PURE["/segmented_cloud_pure<br/>地面处理分支收集的非地面候选"]
+    C["连通簇分割<br/>segment_theta + 簇点数及跨行检查"]
+    SEG["/segmented_cloud<br/>有效簇 + 稀疏化地面<br/>附带地面标记、原始列号及距离"]
+    OUT["/outlier_cloud<br/>无效簇的部分采样点"]
+    F["FeatureAssociation<br/>曲率、遮挡及邻域筛选<br/>每行按点索引分成 6 段"]
+    E["/laser_cloud_sharp<br/>/laser_cloud_less_sharp：边缘特征"]
+    A["/laser_cloud_flat：精选地面平坦特征<br/>/laser_cloud_less_flat：较宽的非边缘候选"]
+    U0 --> O
+    U1 --> L
+    L --> B
+    O --> S
+    L -->|"匹配点云时间戳，反变换"| S
+    S --> P --> G
+    G --> PG
+    G --> PURE
+    G --> C
+    C --> SEG
+    C --> OUT
+    SEG --> F
+    F --> E
+    F --> A
+```
+
+UDP 6100 的点已经位于设备世界坐标系，不能只改 `frame_id` 就当作雷达局部点。其局部化依赖同时间戳的 UDP 6101 位姿和安装外参：
+
+```text
+p_lidar = inverse(T_odom_lidar) × p_odom
+T_odom_base = T_odom_lidar × inverse(T_base_lidar)
+p_base = T_base_lidar × p_lidar
+```
+
+因此，设备 odom 发散会连带破坏局部点云、特征提取和 MCL。应先比较 UDP 原始值、`/astrall/lidar/odometry`、`/astrall/base/odometry`，再检查下游算法。导航中 Astrall 通常关闭直接广播 `odom → base_link`，但仍发布里程计话题；MCL 的 `cbOdom()` 接收并原样广播这段 TF。关闭 TF 广播不等于关闭里程计数据流。
+
+### 17.2 投影网格不是实际有效点数
+
+示例配置 `180 × 720` 表示 180 行、720 列的投影格子，720 列覆盖完整 360°，不是每行必有 720 个点。以配置的 120°水平视场估算，只覆盖约 `720 × 120 / 360 = 240` 列；空回波、投影重合和过滤还会减少有效点。实际角度覆盖应以设备数据验证。
+
+分割后的每行点被压缩存储，并保留原始列号。特征提取的“6 段”按这一行的点索引划分，不保证等角度，也不自动按空列断段。选点后的邻域抑制遇到相邻列号差大于 10 会停止；这不能证明所有曲率和遮挡计算都适配不连续扫描。Odin1 若出现大量空列，应另外检查扫描组织和邻域计算。
+
+### 17.3 两种 segmented 点云的区别
+
+它们是从投影点云分出的两条处理路径，**不存在 `segmented_cloud → 再过滤 → segmented_cloud_pure` 的关系，也不是严格子集关系**。
+
+| 输出 | 当前实际来源 | 用途及限制 |
+|---|---|---|
+| `segmented_cloud_pure` | 地面处理期间，收集法向检查失败、坡度或高度差超限的部分点，以及地面检测角度范围外满足分支条件的点 | 供实时动态障碍感知；并非全部非地面点，也没有经过下面的有效簇筛选 |
+| `segmented_cloud` | 连通分割后，提取有效标签或地面标记点；剔除无效簇标签；地面通常只保留每 5 列中的 1 列，网格边界有例外 | 特征提取输入；包含地面与非地面，而非完整原始点云 |
+| `outlier_cloud` | 无效簇中按列采样保留的部分点 | 查看被簇筛选排除的结构；不是所有被过滤点的完整集合 |
+| `ground_cloud` | 地面检测和受约束补片后形成 `patched_ground`，再按当前实现的 0.1 m 体素降采样 | 建图地面来源之一；包含推算补点，不等于每个点都有直接雷达回波 |
+
+`segmented_cloud_pure` 的部分失败分支直接跳过点，例如缺少有效邻居或某些高度检查失败，不保证全部转为障碍候选。当前 `cloudSegmentation()` 末尾“按有效簇填充 pure”的代码块被注释，因此不能只观察 pure 来评价 `segment_*` 参数效果。
+
+### 17.4 各阶段哪些参数影响点云质量
+
+下表是当前源码行为；数值为配置示例，不是通用最优值。
+
+| 阶段 | 参数或条件 | 对输出质量的影响 |
+|---|---|---|
+| 设备及坐标转换 | 点云比例 `1e-4`、odom 比例 `1e-6`；时间同步、`base_link → lidar_link` 外参、odom 连续性 | 单位、时间或外参错误会造成尺度错误、双影、旋转错位；不应靠分割阈值补偿 |
+| 投影 | `num_vertical_scans`、`num_horizontal_scans`、`vertical_angle_bottom/top`、`horizontal_fov` | 决定投影组织或输入点数检查；网格过细可能增加空格，过粗可能丢细节。水平列数按完整 360°定义 |
+| 输入处理 | `minimum_detection_range`、`maximum_detection_range`、`stitcher_num`、`scan_period` | 影响近远场保留、时间补偿和密度；增加拼帧可能增加运动拖影，不能修复异常 odom |
+| 地面候选范围 | `ground_fov_bottom/top`、`ground_positive_*`、`ground_negative_*` | 控制一路地面检测的垂直及水平扇区；范围外仍可作为非地面点进入后续处理，不是裁掉原始雷达 |
+| 地面几何检查 | `ground_normal_check`、`ground_normal_radius`、`ground_normal_min_neighbors`、`ground_slope_tolerance`、`ground_dz_tolerance` | 邻居不足或条件过严可能损失地面；过松可能误接收障碍。坡度或高度差任一超限即失败 |
+| 地面其他限制及补片 | `use_sensor_height_to_filter_out_ground`（启用时）、`distance_for_patch_between_rings`、`patch_first_ring_to_baselink` | 影响地面保留和补洞；补点不是实测可通行证据。源码还有左右邻居搜索及 0.05 m 高度差等固定检查 |
+| 实验补地面 | `project_walls_to_ground` | 开启时可将有地面支持的竖直面投影加入地面；改变保存地图及后续算法输入，详见前述实验章节 |
+| 连通簇形成 | `segment_theta: 60.0`，单位度 | 在常用 0–90°内，增大更严格、更易断簇；减小更易连接，也可能合并不同物体 |
+| 小簇有效性 | `segment_valid_point_num: 5`、`segment_valid_line_num: 2` | 小簇需达到点数及跨行数；但源码中达到 30 点直接通过，不再检查跨行数 |
+| 边缘提取 | `edge_threshold: 0.1` | 非地面、高曲率且未被邻域排除的点才成为候选；增大通常减少边缘特征 |
+| 平坦特征提取 | `surf_threshold: 0.1` | `flat` 要求地面标记为真、曲率低于阈值且未被邻域排除；减小通常更严格。它不是所有墙面等平面点 |
+| MCL 内部特征处理 | 当前 `flat` 固定 1 m 体素；`less_sharp` 体素边长为输入点数 `/ 3000.0`；法向或聚类分支 | MCL 实际评分用点可能少于话题输入；聚类分支还受 `euc_cluster_*` 等配置影响 |
+| 地图累计 | `distance_between_key_frame`、`angle_between_key_frame`、地图体素、外部里程计模式和闭环参数 | 影响关键帧覆盖、地图密度及重影；增加点数不能抵消错误位姿 |
+| 导航地图加载 | `complete_map_voxel_size` | 改变地图服务器重建点云的密度，影响静态感知输入；不修改原始 PCD，不等于所有 MCL 子图使用相同点集 |
+
+注意：当前建图 YAML 中 `segment_theta` 的“减小更严格”注释与源码 `tang > tan(segment_theta)` 的行为相反，应按上述源码解释判断，本节没有修改运行参数。
+
+地面角度示例：`ground_fov_bottom=-0.7854`、`ground_fov_top=0` 表示约 −45°至 0°参与这一路检测。提高上界会让更多方向进入检查，可能改变 pure 和后续特征；不会把范围内全部点自动改成地面。源码此前另有“相邻点坡度绝对值 ≤5°且法向有效”的地面标记分支，不受这两个角度参数直接限制。
+
+### 17.5 分割与特征筛选的数学含义
+
+相邻投影格子的远、近距离为 `d1 ≥ d2`，角度间隔为 `α`，当前聚类连接条件为：
+
+```text
+d2 × sin(α) / (d1 − d2 × cos(α)) > tan(segment_theta)
+```
+
+簇有效性按代码统计近似表示为：
+
+```text
+N ≥ 30  或  (N ≥ segment_valid_point_num 且 L ≥ segment_valid_line_num)
+```
+
+其中 N 为簇内统计点数，L 为统计到的投影行数。行数要求提供跨垂直方向的支持；列已参与横向相邻连接，但没有单独的最少列数门槛。Odin1 投影行不等于独立实体激光线。
+
+FeatureAssociation 对每行的 6 个索引段分别筛选：
+
+| 话题 | 每段选择规则 | 用途 |
+|---|---|---|
+| `laser_cloud_sharp` | 最多 2 个高曲率非地面边缘点 | 更精选的边缘集合，也是 MCL 同步订阅的话题之一 |
+| `laser_cloud_less_sharp` | 最多 20 个边缘点，包含 sharp | 当前 MCL 边缘匹配输入、建图特征来源 |
+| `laser_cloud_flat` | 最多 4 个满足地面与低曲率条件的点 | 当前 MCL 地面/平坦特征匹配输入 |
+| `laser_cloud_less_flat` | 收集符合标签条件的非边缘候选，再降采样 | 建图 surface 来源；MCL 当前同步订阅但没有将其作为这一路评分点云 |
+
+“最多”不是固定数量；空行、曲率门槛、遮挡和邻域抑制都会使实际点数更少。地面分割后的每 5 列抽样、flat 每段数量限制和 MCL 内部 1 m 体素是三个不同阶段，可能连续减少地面特征。
+
+### 17.6 保存地图、定位与导航的分支
+
+```mermaid
+flowchart TD
+    FE["实时边缘 / surface 特征 + 补片地面"] --> MO["建图关键帧与位姿图"]
+    MO --> FILE["poses.pcd + pcd/*_feature.pcd<br/>pcd/*_surface.pcd + pcd/*_ground.pcd"]
+    FILE --> SERVER["地图服务器按 poses 重建"]
+    SERVER --> MC["/map1/mapcloud：feature"]
+    SERVER --> MS["/map1/mapsurface：surface"]
+    SERVER --> MG["/map1/mapground：ground"]
+    FILE --> SUB["MCL 附近关键帧子图<br/>feature + ground KD-tree"]
+    LIVE["实时 less_sharp + flat<br/>变换、降采样和筛选"] --> SCORE["每个粒子下变换到 map<br/>查询地图近邻、计算权重"]
+    SUB --> SCORE
+    ODOM["/astrall/base/odometry"] --> PRED["粒子运动预测"] --> SCORE
+    SCORE --> EST["位姿估计、协方差、重采样"]
+    EST --> TF["/mcl_pose 与 map → odom"]
+    MC --> STATIC["静态障碍 / 地面感知"]
+    MG --> STATIC
+    PURE["实时 segmented_cloud_pure + TF"] --> DYNAMIC["动态障碍标记和清除"]
+    STATIC --> DG["dGraph：带障碍距离/代价的地面节点"]
+    DYNAMIC --> DG
+    DG --> PLAN["全局路径与局部轨迹规划"]
+```
+
+- `map.pcd` 是当前建图代码保存的聚合 feature/corner 地图，`ground.pcd` 是聚合地面；导航重建主要依赖 poses 和逐关键帧文件。仅编辑聚合 PCD 不会同步修改关键帧地图。
+- `mapsurface` 有独立的 surface 关键帧来源。当前 MCL 虽加载 surface 关键帧，但子图中的 surface 叠加代码被注释；不能把 mapsurface 的显示密度当作 MCL 实际参考地图密度。
+- 实时 `less_sharp` 查询 feature 地图 KD-tree；`flat` 在地面条件健康时查询地面 KD-tree，否则回退到 feature 地图 KD-tree。比较的是局部子图，不是上一帧实时特征。
+- 当前 Astrall 静态感知使用 `mapcloud + mapground`，动态感知使用 `segmented_cloud_pure`。`dGraph` 红点是带障碍代价的地面节点，不是原始墙面回波。
+
+### 17.7 匹配通过、粒子收敛和 TF 更新不是同一件事
+
+当前每个候选粒子的匹配比例为：
+
+```text
+r = 距地图近邻 ≤ likelihood.match_dist_min 的特征点数 / 参与评分特征总数
+当前配置示例：match_dist_min = 0.3 m，max(r) ≥ match_ratio_thresh = 0.60
+```
+
+flat 与 less_sharp 合并统计比例，没有分别通过的要求。检查的是最佳粒子的比例，输出位姿来自粒子群加权估计，TF 还会经过滤波；当前没有对最终输出位姿重新执行同样的匹配门槛。
+
+常规粒子数配置为 60，这与 60% 匹配门槛没有关系。每个满足更新条件的新特征帧经过一次测量后，外层会重采样一次；匹配失败时 measure 内部扩散粒子并返回，外层仍继续重采样。常规重采样保持当前粒子数量，高权重粒子获得更多副本，重复选中的副本会加入扰动，不是无限增加粒子。
+
+Web 的定位就绪判断还检查新鲜度和协方差，当前界面门槛示例为：
+
+```text
+XY σ = sqrt((Cov[x,x] + Cov[y,y]) / 2) ≤ 0.15 m
+Yaw σ = sqrt(Cov[yaw,yaw]) ≤ 0.20 rad
+并且定位消息未过期
+```
+
+小 σ 只表示候选分布集中，不是实测定位误差。狭窄初始分布和重复场景都可能形成错误的集中结果。当前 MCL 在匹配通过后就可能更新 `map → odom`，并不等待 Web 的 σ 门槛通过；原始 odom 不会因此被改写。必须同时核对实际位置、实时结构与地图的对应关系，不能只凭“已收敛”判断定位正确。
+
+该限制的影响、候选修复方向和验证要求统一记录在 [TODO：MCL 地图修正的可信度门槛](#todo-mcl-tf)。
+
+### 17.8 如何区分“特征本来稀疏”和处理故障
+
+按同一时间段逐级比较点数、频率、时间戳、坐标系，而不是仅看复选框：
+
+```text
+UDP/原始 points 正常？
+  → 投影和 segmented_cloud 保留多少？
+  → ground_cloud 是否有地面支持？
+  → flat / less_sharp 是否为空或剧烈变化？
+  → MCL 内部筛选后还剩多少？
+  → 最佳粒子及输出位姿是否真正对齐地图？
+```
+
+Web 的 MCL 图层显示 `laser_cloud_flat`（黄）和 `laser_cloud_less_sharp`（粉）的输入点，不是匹配成功点，也不是内部全部筛选后的点。每层传输上限为 12,000 点，几百个特征点低于该上限，不会因此抽稀；实时点云按消息时间戳查询 TF，缺失 TF 或数据过期也可能导致看不到点。
+
+若原始点有数万而边缘只有几百，可能符合精选特征的设计；若 flat 长期为零或个位数，则需依次检查地面候选、法向邻域、投影连续性、曲率与各阶段降采样。不要为增加显示密度直接放宽所有阈值。独立 odom 显示用于观察底层连续性，地图位姿还包含 MCL 的 `map → odom` 修正，两者不可混为一谈。
+
+源码入口：[设备解析与坐标变换](../robot/astrall/astrall_ros/src/astrall_sensor_node.cpp)、[投影/地面/分割](src/dddmr_lego_loam/lego_loam_bor/src/imageProjection.cpp)、[特征提取](src/dddmr_lego_loam/lego_loam_bor/src/featureAssociation.cpp)、[MCL 输入和 TF](src/dddmr_mcl_3dl/src/mcl_3dl.cpp)、[匹配评分](src/dddmr_mcl_3dl/src/lidar_measurement_model_likelihood.cpp)、[MCL 子图](src/dddmr_mcl_3dl/src/sub_maps.cpp)、[Web 显示](../robot/astrall/web_ui/server.py)。
+
+### 17.9 投影阶段展开：一个原始点怎样进入格子
+
+下面是总图中 ImageProjection 框的展开。`points_base` 用于机身坐标检查；当前 DDDMR 主输入是 `points`（`lidar_link`），不是同时合并这两路点云。
+
+```mermaid
+flowchart TD
+    P0["一帧 lidar_link 点云"] --> P1["前处理：去除无效点<br/>按配置进行帧拼接及输入检查"]
+    P1 --> P2["逐点求 r、垂直角 v、水平角 h"]
+    P2 --> P3{"行列索引在网格内？"}
+    P3 -->|否| PX["跳过这个点"]
+    P3 -->|是| P4{"minimum_detection_range ≤ r<br/>且 r ≤ maximum_detection_range？"}
+    P4 -->|否| PX
+    P4 -->|是| P5["写 range_mat 和 full_cloud<br/>同格后写点覆盖先写点"]
+    P5 --> P6["得到固定行列的稀疏投影网格<br/>未写入的格子仍无有效回波"]
+    P6 --> P7["相邻行地面检查及连通分割"]
+```
+
+以 `p=(x,y,z)` 为例，当前投影代码使用：
+
+```text
+r = sqrt(x²+y²+z²)
+v = asin(z/r)
+h = atan2(y,x)
+Δh = 2π / 水平列数
+Δv = (vertical_angle_top − vertical_angle_bottom) / (垂直行数 − 1)
+row = int((v + 内部_ang_bottom) / Δv)
+col = −round(h / Δh) + 水平列数/2
+```
+
+角度计算时统一转为弧度；内部 `_ang_bottom` 还有源码中的 0.1°边界偏置，并非简单的配置值取反。水平列号超过右边界时环绕。投影写入没有比较“新点是否比旧点近”，也没有在同格求平均：后写覆盖。因此网格分辨率和输入顺序都会影响最终保留点，不能理解为把全部原始点无损排成矩阵。
+
+`horizontal_fov` 在本地实现用于输入数量检查，不把水平网格改成只覆盖前方扇区。以 `180×720`、120°、`stitcher_num=1` 的配置，输入数量检查下限为约 4320 点；这不是要求每行都填满，也不是特征数量门槛。
+
+### 17.10 地面阶段展开：标记地面与生成补片是两件事
+
+本阶段内部同时维护不同结果：
+
+| 内部结果 | 含义 | 去向 |
+|---|---|---|
+| `_ground_mat` | 每个投影格子的地面标记，初值 0；1 为已标记地面，−1 表示相关检查无有效信息/被忽略 | 影响 segmented 中的地面标记及 flat/edge 选择 |
+| `_label_mat` | 连通分割状态；0 为待分割，−1 排除，正整数为簇号，999999 为无效簇 | 决定有效簇和 outlier |
+| `patched_ground` | 由通过几何检查的端点和受约束插值生成的地面集合 | 降采样后发布 ground_cloud |
+| `_segmented_cloud_pure` | 某些分支收集的非地面候选 | 动态感知输入 |
+
+**`ground_cloud` 不直接送进 FA 作为 `laser_cloud_flat`。flat 来自带地面标记的 segmented 点，再经过曲率筛选。** 因此 ground_cloud 多不代表 flat 一定多，地面补片变密也不等于原始特征变密。
+
+以下图按一列中相邻行的 lower/upper 点对展开主要路径；TRT 语义过滤仅在启用模型时插入，不在图中展开。
+
+```mermaid
+flowchart TD
+    G0["取同一列相邻两行 lower、upper"] --> G1{"两个格子都有有效回波？"}
+    G1 -->|否| GX["标记相关格子无有效地面检查信息<br/>结束本点对处理"]
+    G1 -->|是| G2{"命中配置的 ignore 扇区？"}
+    G2 -->|是| GX
+    G2 -->|否| G3{"原坐标点对坡度绝对值 ≤5°<br/>且两端法向有效？"}
+    G3 -->|是| GM["两端 ground_mat=1<br/>label_mat=-1<br/>记录 z/pitch/roll 特征"]
+    G3 -->|否| G4
+    GM --> G4{"两行垂直角和当前水平角<br/>均在 ground FOV 范围？"}
+    G4 -->|否且行号大于0| GP["lower 加入 segmented_cloud_pure"]
+    G4 -->|否且行号为0| GE["结束本点对处理"]
+    G4 -->|是| G5{"两端法向有效？"}
+    G5 -->|否| GP
+    G5 -->|是| G6{"左右均能找到有效邻居？"}
+    G6 -->|否| GS["取消当前补片条件并跳过<br/>此分支不向 pure 加点"]
+    G6 -->|是| G7{"左/中/右各高度差 ≤0.05 m？"}
+    G7 -->|否| GS
+    G7 -->|是| G8{"启用时：传感器高度检查通过？"}
+    G8 -->|否| GS
+    G8 -->|是或未启用| G9{"修正安装俯仰后的点对<br/>坡度及高度差均未超限？"}
+    G9 -->|否| GP
+    G9 -->|是| G10{"点对距离小于<br/>distance_for_patch_between_rings？"}
+    G10 -->|否| GE
+    G10 -->|是| G11["生成端点和约0.1 m间距插值<br/>中间插值还需局部地面支持"]
+    G11 --> G12["汇总 patched_ground<br/>可选首环补片/墙投影<br/>去 NaN，0.1 m体素 → ground_cloud"]
+```
+
+这也解释了为什么不能把 pure 简单写成 `全部点 − 地面`：它由多个分支追加，部分失败点直接跳过，而且前面的地面标记与后面的候选收集不是严格互斥分类。
+
+地面法向检查 `valid_ground_at()` 在当前实现中的条件如下；`ground_normal_check=false` 会旁路此检查：
+
+1. 在安装俯仰角修正后的原始点云中，按 `ground_normal_radius` 查邻居。
+2. 邻居数至少为 `ground_normal_min_neighbors`；最近支持点距离不超过 0.1 m。
+3. 对邻域坐标求协方差特征值 `λ0 ≤ λ1 ≤ λ2`。要求 `λ2 > 1e-10`、`λ1 ≥ 0.05λ2`、`λ0 ≤ 0.05(λ0+λ1+λ2)`，排除近似线状及不够平面的邻域。
+4. 最小特征值对应法向满足 `|nz| ≥ cos(ground_slope_tolerance)`，要求表面接近水平。
+
+左右邻居搜索最多向各侧查看 19 列，跳过无效点和水平距离不足 0.05 m 的点；两侧都需要找到支持。安装俯仰修正不是完整的逐帧 IMU 重力校正。这些条件叠加后，即使眼睛看见地面，也可能因为投影空洞、近邻不足或高度噪声而不产生可用地面特征。
+
+### 17.11 连通分割展开：哪些点进入 segmented
+
+```mermaid
+flowchart TD
+    C0["遍历投影格子"] --> C1{"label_mat=0？"}
+    C1 -->|否| C6["保留既有标记，检查下一格"]
+    C1 -->|是| C2["以该格为种子，邻接搜索扩展簇"]
+    C2 --> C3{"相邻格尚未标记<br/>且几何连接量大于 tan(theta)？"}
+    C3 -->|是| C4["加入同一簇和搜索队列<br/>统计点数及到达的行"]
+    C4 --> C2
+    C3 -->|不连接，继续检查其他邻居| C5["队列耗尽，完成本簇"]
+    C5 --> C7{"N≥30 或 N≥5且L≥2？<br/>5和2来自当前配置"}
+    C7 -->|是| C8["保留正整数簇标签"]
+    C7 -->|否| C9["簇标签置999999"]
+    C8 --> E0["遍历格子，提取输出"]
+    C9 --> E0
+    C6 --> E0
+    E0 --> E1{"标签999999？"}
+    E1 -->|是| EO["每5列采部分有效点到 outlier<br/>不进入 segmented"]
+    E1 -->|否| E2{"有效簇标签或地面标记？"}
+    E2 -->|否| EX["不进入 segmented"]
+    E2 -->|是| E3{"是地面，且属于要跳过的列？"}
+    E3 -->|是| EX
+    E3 -->|否| E4["有限点加入 segmented<br/>同步记录 range / col / ground_flag"]
+```
+
+图中的队列处理为概念展开：一个邻居不连接并不立即结束整个簇，只有队列耗尽才进行有效性判断。行计数是源码 `lineCountFlag` 的统计；它在邻居加入时置位，种子行不是一开始单独置位，极小簇边界情况应按实现判断。
+
+每行提取后记录 `start_ring_index = 行起始计数−1+5`、`end_ring_index = 行结束计数−1−5`，为后面的前后邻域留边界。有效点很少的行/段可能没有可处理区间。因此不应只看某行有几个点，还要看扣除边界后是否能提取特征。
+
+### 17.12 曲率、遮挡、六段选点展开
+
+当前“曲率”是距离序列的变化量，不是拟合三维曲面的严格微分曲率：
+
+```text
+D[i] = r[i−5]+...+r[i−1] − 10r[i] + r[i+1]+...+r[i+5]
+C[i] = D[i]²
+```
+
+例如邻域距离都为 5 m，则 `D=0`；若中心点为 4 m，其余十点均为 5 m，则 `D=10 m`、`C=100 m²`，很容易超过 `edge_threshold=0.1`。实际还有非地面标记和遮挡筛除，所以并非每个距离突变都成为边缘。
+
+**已核实：`calculateSmoothness()` 直接使用压缩数组的前后各5个点，不检查这11个点的原始列号连续性。** 后面的每行索引边界减少跨行选点，但不能消除同一行内部空列带来的不连续。此前“有列间隔检查”的结论只适用于后述特定步骤，不能推广到曲率计算。
+
+```mermaid
+flowchart TD
+    F0["segmented + range/col/ground_flag"] --> F1["前后各5点求 D²<br/>初始化 cloudNeighborPicked=0"]
+    F1 --> F2["遮挡筛选及孤立距离突变筛选<br/>置 cloudNeighborPicked=1"]
+    F2 --> F3["每行按索引范围分6段<br/>无有效区间的段跳过"]
+    F3 --> F4["每段按曲率排序"]
+    F4 --> F5{"从大到小：未被排除<br/>非地面且C大于edge_threshold？"}
+    F5 -->|是| F6["前2个 → sharp及less_sharp<br/>第3至20个 → less_sharp"]
+    F6 --> F7["标记已选及相邻点，避免重复选取"]
+    F5 -->|否| F8["继续检查其他候选"]
+    F7 --> F9["同段再从小曲率向大曲率检查"]
+    F8 --> F9
+    F9 --> F10{"未被排除、地面标记为真<br/>且C小于surf_threshold？"}
+    F10 -->|是| F11["最多4个 → flat<br/>按代码标记选择状态及邻域"]
+    F10 -->|否| F12["继续检查其他候选"]
+    F11 --> F13["收集 cloudLabel≤0 的候选<br/>按行0.2 m体素 → less_flat"]
+    F12 --> F13
+```
+
+流程图中的选点框表示对候选循环执行，不是每段只检查一次。遮挡/邻域相关固定条件：
+
+| 步骤 | 当前条件 | 对候选的作用 |
+|---|---|---|
+| 相邻深度突变 | 相邻列号差 `<10`，距离差 `>0.3 m` | 标记远侧一段邻域，避免将遮挡边界当作稳定特征 |
+| 两侧均突变 | 与前后点的距离差都 `>0.02×当前距离` | 标记该点，抑制不稳定/掠射候选；此条件自身没有列间隔判断 |
+| 选中特征后的抑制 | 向前后最多查看5个点；相邻列号差 `>10` 就停止 | 避免同一局部连续边缘反复占用名额 |
+| less_flat 收集 | `cloudLabel≤0` | 不等于所有点都通过严格平面检查；可能含未选中的非地面候选，也包含 flat |
+
+这里的遮挡距离阈值 0.3 m，与 MCL 的 `likelihood.match_dist_min=0.3 m` 是两个独立机制：前者比较一帧中的相邻距离，后者比较实时特征与地图近邻距离。
+
+### 17.13 MCL 内部与地图查询进一步展开
+
+```mermaid
+flowchart TD
+    M0["同步接收 sharp / less_sharp / flat / less_flat"] --> M1{"当前地图子图就绪<br/>且雷达到base_link外参可用？"}
+    M1 -->|否| MW["等待，不处理这组特征"]
+    M1 -->|是| M2["实际取 flat、less_sharp<br/>变换到 base_link"]
+    M2 --> M3["flat：1 m体素<br/>less_sharp：点数/3000米体素"]
+    M3 --> M4["边缘邻域K=5求法向<br/>检查X/Y方向是否占主导"]
+    M4 --> M5["主导方向分支：按法向调整权重<br/>否则：欧式聚类、去小簇并设置权重"]
+    M5 --> M6{"新特征帧尚未处理<br/>且有包围其时间戳的odom？"}
+    M6 -->|否| MW
+    M6 -->|是| M7["按移动量/静止更新间隔触发<br/>里程计预测粒子"]
+    M7 --> M8["每粒子把两类特征变换到map"]
+    M8 --> M9["less_sharp → feature地图近邻<br/>flat → ground近邻，条件不足回退feature"]
+    M9 --> M10["计算似然及合并匹配率"]
+    M10 --> M11{"最高匹配率≥门槛？"}
+    M11 -->|否| M12["扩散粒子；本次不发布新定位"]
+    M11 -->|是| M13["粒子加权估计、协方差<br/>更新map→odom及mcl_pose"]
+    M12 --> M14["外层重采样，等待下一帧"]
+    M13 --> M14
+```
+
+这里的欧式聚类与 ImageProjection 的连通簇分割不同：前者在降采样后的三维边缘点上按欧式距离聚类，使用 `euc_cluster_distance/min_size`；后者在投影网格上按相邻格距离几何聚类，使用 `segment_theta/valid_*`。不要混用两组参数。
+
+MCL 的 `flat` 地面条件检查和位置权重还涉及 `radius_of_ground_search`、`threshold_for_trusted_ground` 及地图地面法向。点数达到阈值不代表场景可唯一定位：长直走廊、重复结构以及缺少地面支持，可能使某些方向约束很弱。
+
+### 17.14 一组点数如何逐步变少：诊断用示例
+
+以下是此前一次约10秒窗口的各话题**点数中位数**，不是严格同一帧配对，不代表固定比例或验收标准：
+
+```text
+原始 points             35,214
+  ├─ pure               25,494   地面分支收集的非地面候选
+  ├─ ground_cloud          165   补片/检查/降采样后的另一条地面输出
+  └─ segmented           4,128   有效簇 + 稀疏地面
+       ├─ sharp            335
+       ├─ less_sharp       346   包含sharp，不能与sharp相加
+       ├─ flat               8
+       └─ less_flat        991   和其他集合也不是互斥划分
+            ↓
+       MCL内部再降采样/筛选，实际评分点可能更少
+```
+
+应在每个箭头统计“输入点数、输出点数、淘汰原因、处理耗时、时间戳”，才能定位稀疏发生在哪一层。尤其要分别统计地面候选的失败原因、两类特征的匹配率和最终输出位姿下的匹配质量，不能由总匹配率或 σ 反推全部结构已经对齐。
+
+## 18. 当前路径规划与速度输出实现
+
+本节描述当前 Astrall 导航集成。参数示例来自导航模板，WebUI 生成的运行 YAML 可覆盖部分值；频率为配置目标，不是实时性能保证。建图参数不会自动成为导航规划参数。
+
+### 18.1 从导航目标到运动指令
+
+```mermaid
+flowchart TD
+    GOAL["网页设置目标 /goal_pose_3d"] --> TASK["p2p_move_base 管理导航任务"]
+    TF["map → base_link：机器人地图位姿"] --> GLOBAL
+    MAP["mapcloud + mapground"] --> STATIC["静态障碍判定、地面节点和连边"]
+    LIVE["segmented_cloud_pure + 同时间TF"] --> DYN["动态障碍标记与清除"]
+    STATIC --> GRAPH["融合障碍距离/代价的地面图"]
+    DYN --> GRAPH
+    TASK --> GLOBAL["全局A*搜索<br/>get_dwa_plan动态感知路径包装层"]
+    GRAPH --> GLOBAL
+    GLOBAL --> PATH["/awared_global_path"]
+    PATH --> PRUNE["裁剪机器人附近的参考路径"]
+    ODOM["机身里程计位姿和实际速度"] --> LOCAL["动态窗口采样速度<br/>按加减速度约束预测轨迹"]
+    PRUNE --> LOCAL
+    LOCAL --> SCORE["碰撞检查、贴线、前视目标及前进评分"]
+    GRAPH --> SCORE
+    SCORE --> CHOOSE["选择可行轨迹，输出当前速度<br/>下周期重新计算"]
+    CHOOSE --> CMD["/cmd_vel"]
+    CMD --> BRIDGE["Astrall桥：权限、模式、超时、限幅和轴映射"]
+    BRIDGE --> SDK["AstrallMove → 设备运动控制"]
+```
+
+这是全局与局部协同规划，不是直接在原始点云上画一条直线，也不是收到全局路径后开环执行到终点。MCL 负责地图定位；规划器使用该位姿及感知结果，不负责修复错误定位。
+
+### 18.2 全局规划：在地面图上找路线
+
+`mapground` 提供地面采样节点，静态感知建立邻接关系；`mapcloud` 用于静态障碍支持判定，实时雷达层更新障碍距离/代价。dGraph 的红点是危险地面节点，不是原始障碍回波。
+
+全局规划使用 A* 的地面点云/预建图实现，具体分支由 `use_pre_graph` 决定，代价考虑距离、转弯和地面代价等。起点从地图中的机器人位姿获得，目标需能关联到可搜索地面图。没有足够地面、节点不连通或通路被障碍排除，都可能导致无有效路径。
+
+当前任务管理器使用 `/get_dwa_plan` **action** 获取动态感知路径，控制器跟踪 `/awared_global_path`。动态包装层先计算完整路线，再依据当前位置、前视窗口及动态感知重算相关路径；名字中的 DWA 不代表全局层只是在采样速度。模板的 `look_ahead_distance=2.0 m`、`recompute_frequency=10 Hz` 与任务管理器 `global_plan_query_frequency=5 Hz` 是不同循环，不能合并理解为同一频率。
+
+### 18.3 局部规划：每周期重算未来短时轨迹
+
+局部规划器从全局路径中裁剪附近段，结合机身里程计速度，在加减速度限制允许的窗口内采样 `(vx, vy, wz)`。候选轨迹按运动模型积分，并沿预测过程检查机器人碰撞长方体。
+
+| 当前模板参数 | 示例值 | 含义 |
+|---|---:|---|
+| `controller_frequency` | 10 Hz | 目标约每0.1秒重新计算一次 |
+| `forward_prune / backward_prune` | 1.0 / 1.0 m | 局部参考路径裁剪范围 |
+| `sim_time` | 2.0 s | 每个候选的前向预测时长，不是一次执行时长 |
+| `linear_x_sample / linear_y_sample / angular_z_sample` | 5 / 1 / 10 | 基础采样数量；有效窗口、过滤和制动候选会改变实际轨迹数 |
+| `min_vel_x / max_vel_x` | −0.1 / +0.1 m/s | 正常行驶前后速度范围 |
+| `min_vel_y / max_vel_y` | 0 / 0 | 不主动下发横移，仍考虑实际侧向速度用于预测 |
+| `max_vel_theta` | 0.1 rad/s | 正常行驶轨迹角速度上限；原地旋转有独立分支 |
+| `acc_lim_x / acc_lim_theta` | 0.1 m/s² / 0.2 rad/s² | 限制预测加速过程 |
+| `sample_braking_commands` | true | 增加减速至零候选，不假设机器人能瞬间停住 |
+| `sim_granularity / angular_sim_granularity` | 0.05 m / 0.025 rad | 轨迹碰撞离散检查尺度 |
+
+轨迹生成器名为 `OmniSimpleTrajectoryGeneratorTheory`，但当前配置的 Y 指令范围为零。正常运动、原地对准和恢复旋转使用不同生成/评分分支，不能用正常行驶的角速度上限解释所有旋转行为。
+
+### 18.4 候选轨迹怎样选出来
+
+| 评分器 | 作用 |
+|---|---|
+| `CollisionModel` | 按感知数据和碰撞外形检查轨迹，排除不可行候选并评价障碍代价 |
+| `StickPathModel` | 惩罚偏离全局参考路径 |
+| `PurePursuitModel` | 鼓励接近前视目标，包含位置和朝向评分 |
+| `TowardGlobalPlanModel` | 鼓励向参考路线推进 |
+| 旋转碰撞及 `ShortestAngleModel` | 对原地旋转分支进行碰撞检查和转角选择 |
+
+当前 `planar_tracking=true` 用于部分跟踪评分，使路径地面高度与机身高度的差异不计入该项平移误差；碰撞检查仍使用三维几何。选中候选后只输出本周期指令，下周期使用新的位置、速度和障碍信息重算。
+
+没有可行轨迹时不能继续当作路径有效：任务状态机会根据原因、超时和恢复设置进入停止、等待、重试或恢复。当前启用了原地旋转恢复插件，但它不是遇到任何故障都自动旋转；定位、感知及控制条件仍需满足。定位超时的当前配置示例为1秒，不能用“仍有TF”替代新的有效MCL测量。
+
+#### Web 同时显示全局与局部规划
+
+“规划路径”开关统一控制：绿色 `/awared_global_path`、蓝色可行局部候选、淡红色被拒绝候选、黄色粗线最优局部轨迹。被拒绝候选仅用于诊断，不能执行。候选包含不同速度和转向，重叠或原地旋转时位置线条可能重合。
+
+局部规划器新增 `/local_trajectory_candidates`（`visualization_msgs/MarkerArray`），每个评分周期发布完整快照，以独立 `LINE_STRIP` 保留每条轨迹边界，并将 best 单独标记。旧 `/accepted_trajectory` 是多个轨迹拼接的 PoseArray，不能直接连成一条路径。Web 仅接受该输出的 map 坐标数据，1秒未收到新快照即清除局部轨迹；没有运行局部规划时，不会人为生成候选。新增输出和界面需重新加载已编译的规划器及重启 Web 后生效。
+
+### 18.5 具体例子：走廊中途出现箱子
+
+```text
+1. 全局规划：A ───────────────── B（前方5米）
+2. 局部规划：直行候选安全、贴线，选中并输出本周期前进速度。
+3. 雷达观测到箱子：A ───── 箱子 ───── B
+4. 下一局部周期：直行碰撞则淘汰；转向绕行若安全且评分合适可被选中。
+5. 空间不足：减速/停止，等待重新规划或任务状态处理，不能保证一定绕过去。
+6. 障碍通过后：后续局部周期逐渐回到参考路线。
+```
+
+以0.1 m/s匀速预测2秒，轨迹约0.2 m；从静止加速时更短。当前不主动横移，绕行通过转向和前进完成。全局路径、局部轨迹及实际机身响应是三个不同结果：有路径不代表有可行速度，有速度输出不代表设备已经执行。
+
+### 18.6 从 cmd_vel 到真实速度
+
+当前 Astrall 桥将 `/cmd_vel` 经控制权/运动模式检查、命令超时检查、限幅及轴映射后送入 `AstrallMove`。机身速度反馈来自连续 base_link 里程计位姿的差分，转换到机身坐标并平滑；不是网页 map 位姿差分，也不是对 SDK 速度闭环能力的证明。
+
+路径规划决定期望速度，速度跟踪控制决定实际速度如何接近期望。当前没有在此链路中新增外部速度 PID。拟议方案已列入 [TODO：外部机身速度 PID](#todo-external-pid)，实施前需确认 SDK 输入语义及内部闭环边界。
+
+源码：[全局规划](src/dddmr_global_planner/src/global_planner.cpp)、[动态感知路径](src/dddmr_global_planner/src/dynamic_window_aware_global_planner.cpp)、[局部规划](src/dddmr_local_planner/local_planner/src/local_planner.cpp)、[碰撞评分](src/dddmr_local_planner/mpc_critics/models/collision_model.cpp)、[任务管理](src/dddmr_p2p_move_base/src/p2p_move_base.cpp)、[Astrall 控制及速度估计](../robot/astrall/astrall_ros/src/astrall_sensor_node.cpp)。
+
+## 19. TODO：待决定的定位与速度控制改进
+
+本节统一记录尚未实施的改进项，不代表已经启用，不自动改变运行参数或授权实机运动。
+
+- [ ] 评估 MCL 接受地图修正前的可信度门槛，决定是否修复。
+- [ ] 确认 SDK 控制接口，评估外部机身速度 PID，决定实现及调试方案。
+
+<a id="todo-mcl-tf"></a>
+
+### 19.1 MCL 地图修正的可信度门槛
+
+**状态：已记录，待以后决定是否修复；当前未增加新的 TF 发布门槛。**
+
+当前 `MCL3dlNode::measure()` 的处理顺序为：
+
+```text
+计算每个粒子的匹配率和权重
+  → 最佳粒子匹配率达到 match_ratio_thresh（当前配置示例 0.60）
+  → 计算粒子群加权位姿估计 T_map_base
+  → 使用雷达帧对应时间的里程计反算：
+      T_map_odom = T_map_base × inverse(T_odom_base)
+  → 对修正进行滤波，更新待广播 TF，并发布 /mcl_pose 及协方差
+  → Web 收到位姿后，独立检查 σ 和数据新鲜度
+```
+
+因此，Web 判定“未收敛”不会撤销或阻止 MCL 更新 `map → odom`。当前也不要求连续多帧确认后才接受这次修正。最佳粒子的匹配率通过，不代表粒子群加权估计或滤波后的最终位姿同样通过；当前未对最终输出位姿重新检查匹配率。
+
+**可能影响：** 在初值错误、观测不足、重复结构或粒子分布分散时，错误估计可能修改整条地图坐标链。即使原始 `odom → base_link` 稳定，地图中的机器人和实时点云仍可能漂移或跳变。Web 的导航准入检查与 TF 发布是两个环节，不能用界面“禁止导航”推断 TF 未更新；低 σ 本身也不能排除错误收敛。
+
+**后续评估方向（尚未选定方案）：**
+
+- 在最终输出位姿下重新检查匹配质量，并分别记录地面与边缘的匹配率、有效点数。
+- 结合协方差、连续不同雷达帧的一致性、里程计运动和修正跳变量，评估是否接受地图修正；不能只增加一个 σ 门槛。
+- 区分初次定位、正常跟踪和定位失效恢复，避免门槛过严导致无法初始化或找回定位。
+- 若拒绝新修正，评估保留最后可信 `map → odom`、继续内部搜索并明确标记定位失效的策略。首次尚无可信修正、旧修正的 TF 时间戳以及定位新鲜度需要单独设计，不能通过刷新旧 TF 时间戳伪装成新匹配。
+
+决定实现前，使用静止、转向、短距离运动、错误初值、重复走廊和短时失配的数据验证：既要抑制错误地图修正，也要保留正确跟踪和恢复能力。当前记录不改变原始 odom、TF 所有权或任何运行参数。
+
+相关实现：[MCL 位姿估计与 TF 发布](src/dddmr_mcl_3dl/src/mcl_3dl.cpp)、[匹配评分](src/dddmr_mcl_3dl/src/lidar_measurement_model_likelihood.cpp)、[Web 收敛与新鲜度检查](../robot/astrall/web_ui/server.py)。
+
+
+<a id="todo-external-pid"></a>
+
+### 19.2 外部机身速度 PID
+
+**状态：需求已记录，未实现；SDK 内部闭环和控制接口语义仍需确认。** 根据与厂家的讨论，拟评估读取实际机身速度、在外部调节发给 SDK 的指令，以改善速度跟踪。这不意味着已经确认厂家内部没有闭环，也不意味着 PID 能解决定位或规划错误。
+
+```mermaid
+flowchart LR
+    P["局部规划 /cmd_vel<br/>期望机身速度"] --> E["误差：目标−实际"]
+    F["有效机身速度反馈<br/>同单位、同坐标系、检查时间戳"] --> E
+    E --> PID["拟新增外部PID<br/>含限幅、抗积分饱和、状态复位"]
+    PID --> G["既有权限、模式、超时和停止保护"]
+    G --> SDK["SDK指令 → 设备内部控制 → 实际运动"]
+    SDK --> F
+```
+
+单轴示意为 `e(t)=v_target(t)−v_measured(t)`、`Δu=Kp·e+Ki·∫e dt+Kd·de/dt`。若 SDK 指令本身就是速度设定值，可评估“目标速度前馈 + PID补偿”；若是归一化摇杆量或其他量，必须先明确映射，不能直接把 m/s 误差当成指令值。图中的 PID 位置是方案草案，不是现有代码结构。
+
+例如目标前进速度0.10 m/s、反馈0.06 m/s，则误差为0.04 m/s，PID可产生正向补偿；响应接近目标后补偿应收敛。增益、周期和补偿上限均待实测，不在文档中给出未经验证的默认值。
+
+实施前需要确认和验证：
+
+1. **接口边界**：SDK各轴单位、正负方向、范围、刷新频率、延迟，以及设备已有速度闭环；避免外环过快与内部控制相互作用。
+2. **反馈质量**：使用机身坐标下可信且新鲜的实际速度；检查 odom 跳变、时间倒退及差分噪声。设备里程计异常时禁止补偿，不能因为假速度而加大指令。
+3. **输出约束**：与规划器和控制桥的速度/加速度约束一致；限制补偿，积分抗饱和，并处理微分噪声。不能通过PID绕过碰撞判定、权限或停止机制。
+4. **状态切换**：目标为零、取消目标、命令超时、定位失效、反馈过期和控制权丢失时，停止逻辑优先并清理积分等状态，避免停车后仍有残余输出。
+5. **轴与时间尺度**：先决定控制 vx / wz 的边界，当前导航不主动横移，不默认新增 vy 控制；区分规划10 Hz、SDK发送频率及反馈频率，用实际 dt 计算。
+6. **验收数据**：经另行授权的低速测试记录目标、反馈、SDK指令及时间戳，比较稳态误差、超调、响应延迟和制动距离，再决定是否启用。检查输出补偿后的实际运动是否仍符合局部轨迹模型。
+
+外部 PID 只负责速度跟踪，不能替代全局/局部规划、地图定位或障碍感知。当前文档更新不启动 PID、不获取控制权、不执行运动测试。
