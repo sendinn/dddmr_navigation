@@ -73,6 +73,9 @@ class TrajectoryGeneratorSharedData{
     nav_msgs::msg::Odometry robot_state_;
     ackermann_msgs::msg::AckermannDriveStamped ackermann_drive_state_;
     nav_msgs::msg::Path prune_plan_;
+    uint64_t rotation_reference_epoch_ = 0;
+    double rotation_error_ = 0.0;
+    double path_heading_lookahead_ = 0.5;
     double current_allowed_max_linear_speed_;
     geometry_msgs::msg::TwistStamped ref_twist_for_trajectory_generation_;
     

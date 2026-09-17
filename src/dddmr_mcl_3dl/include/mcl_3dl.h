@@ -30,6 +30,8 @@
 #ifndef MCL_3DL_CLASS_H
 #define MCL_3DL_CLASS_H
 
+#include <std_srvs/srv/set_bool.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -142,6 +144,9 @@ class MCL3dlNode : public rclcpp::Node
     std::shared_ptr<message_filters::Synchronizer<LegoSyncPolicy>> syncApproximate_;
 
   private:
+    bool odom_only_ = false;
+    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr odom_only_service_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr odom_only_pub_;
     // Caller holds protect_measure_in_odomcb_; both input callbacks may update.
     void updateFromLatestFeatures();
     bool planar_mode_ = false;

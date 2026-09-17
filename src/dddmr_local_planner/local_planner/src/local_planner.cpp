@@ -29,6 +29,7 @@
 * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #include <local_planner/local_planner.h>
+#include <trajectory_generators/single_axis_tracking.h>
 
 namespace local_planner {
 
@@ -229,60 +230,27 @@ double Local_Planner::getShortestAngleFromPose2RobotHeading(tf2::Transform m_pos
 
 }
 
+void Local_Planner::resetRotationReference() {
+  path_heading_locked_ = false;
+  ++trajectory_generators_ros_->getSharedDataPtr()->rotation_reference_epoch_;
+}
+
 bool Local_Planner::isInitialHeadingAligned(){
 
-  prunePlan(heading_tracking_distance_, 0.0);
-  if(prune_plan_.poses.size()<3){
-    RCLCPP_WARN_THROTTLE(this->get_logger().get_child(name_), *clock_, 5000, "Prune plan is too short when checking initial heading.");
-    return false;
-  }
-  
-  //@ Get first/last pose from prune plan
-  geometry_msgs::msg::PoseStamped first_pose = prune_plan_.poses.front();
-  geometry_msgs::msg::PoseStamped last_pose = prune_plan_.poses.back();
-
-  //@ Generate a pose pointing from first pose to last pose
-  double vx,vy,vz;
-  vx = last_pose.pose.position.x - first_pose.pose.position.x;
-  vy = last_pose.pose.position.y - first_pose.pose.position.y;
-  vz = last_pose.pose.position.z - first_pose.pose.position.z;
-  tf2::Quaternion q;
-  if(vz!=0){
-    double unit = sqrt(vx*vx + vy*vy + vz*vz);
-    
-    tf2::Vector3 axis_vector(vx/unit, vy/unit, vz/unit);
-
-    tf2::Vector3 up_vector(1.0, 0.0, 0.0);
-    tf2::Vector3 right_vector = axis_vector.cross(up_vector);
-    right_vector.normalized();
-    tf2::Quaternion q_pre(right_vector, -1.0*acos(axis_vector.dot(up_vector)));
-    q_pre.normalize();
-    q = q_pre;
-  }
-  else{
-    //@ handle with 2D
-    double yaw = atan2(vy, vx);
-    tf2::Quaternion q_pre;
-    q_pre.setRPY(0.0, 0.0, yaw);
-    q = q_pre;
-  }
-
-  tf2::Transform tf2_prune_pointing_pose;
-  //@Transform last pose to tf2 type
-  //tf2::Quaternion(q.getX(), q.getY(), q.getZ(), q.getW())
-  tf2_prune_pointing_pose.setRotation(q);
-  tf2_prune_pointing_pose.setOrigin(tf2::Vector3(first_pose.pose.position.x, first_pose.pose.position.y, first_pose.pose.position.z));
-
-  //@Update the value to critics that allow the robot to turn by shortest angle
-  double yaw = getShortestAngleFromPose2RobotHeading(tf2_prune_pointing_pose);
-  mpc_critics_ros_->getSharedDataPtr()->heading_deviation_ = yaw;
-  
-  RCLCPP_DEBUG(this->get_logger().get_child(name_), "Heading difference from the prune plan starting at %.2f is %.2f", heading_tracking_distance_, yaw);
-
-  if(fabs(yaw) < heading_align_angle_)
-    return true;
-  else
-    return false;
+  // Identical XY reference and pruning as the single-axis tracking controller.
+  prunePlan(std::max(forward_prune_, heading_tracking_distance_), backward_prune_);
+  std::vector<std::array<double,2>> path;
+  for (const auto& p : prune_plan_.poses)
+    path.push_back({p.pose.position.x, p.pose.position.y});
+  const auto& pose = trans_gbl2b_.transform;
+  tf2::Quaternion q(pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w);
+  double roll, pitch, yaw;
+  tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+  const auto errors = trajectory_generators::trackingErrors(
+    path, pose.translation.x, pose.translation.y, yaw, heading_tracking_distance_);
+  if (!errors.valid) return false;
+  mpc_critics_ros_->getSharedDataPtr()->heading_deviation_ = errors.heading;
+  return std::abs(errors.heading) < heading_align_angle_;
 }
 
 bool Local_Planner::isGoalHeadingAligned(){
@@ -565,8 +533,22 @@ void Local_Planner::getBestTrajectory(std::string traj_gen_name, base_trajectory
     marker.color.g = kind == "rejected" ? 0.3 : 0.8;
     marker.color.b = kind == "accepted" ? 1.0 : 0.2;
     marker.lifetime.sec = 1;
-    for (unsigned int i = 0; i < trajectory.getPosesSize(); ++i)
-      marker.points.push_back(trajectory.getPose(i).pose.position);
+    // Rotation has a stationary center: draw the body-front point's swept arc
+    // rather than an invisible stack of identical center positions.
+    const bool rotation = std::abs(trajectory.thetav_) > 1e-6 &&
+      std::hypot(trajectory.xv_, trajectory.yv_) < 1e-6;
+    if (rotation) marker.ns += "_rotation";
+    for (unsigned int i = 0; i < trajectory.getPosesSize(); ++i) {
+      const auto& pose = trajectory.getPose(i).pose;
+      auto point = pose.position;
+      if (rotation) {
+        tf2::Quaternion q(pose.orientation.x, pose.orientation.y,
+                          pose.orientation.z, pose.orientation.w);
+        const auto front = tf2::quatRotate(q, tf2::Vector3(0.45, 0, 0));
+        point.x += front.x(); point.y += front.y(); point.z += front.z();
+      }
+      marker.points.push_back(point);
+    }
     markers.markers.push_back(marker);
   };
   for (const auto& trajectory : *trajectories_)
@@ -606,7 +588,7 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   //@ forward_prune_/backward_prune_: should adapt to vehicle speed.
   //@ prune plan are used by trajectory_generators/perception
   //@ prune plan has to come after mutex lock, because global_plan_ros_sub_ reset global plan kd tree
-  prunePlan(forward_prune_, backward_prune_);
+  prunePlan(std::max(forward_prune_, heading_tracking_distance_), backward_prune_);
 
   sensor_msgs::msg::PointCloud2 ros2_aggregate_onservation;
   pcl::toROSMsg(*(perception_3d_ros_->getSharedDataPtr()->aggregate_observation_), ros2_aggregate_onservation);
@@ -631,11 +613,18 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   trajectory_generators_ros_->getSharedDataPtr()->robot_state_ = robot_state_;
   trajectory_generators_ros_->getSharedDataPtr()->ackermann_drive_state_ = ackermann_drive_state_;
   trajectory_generators_ros_->getSharedDataPtr()->prune_plan_ = prune_plan_;
+  trajectory_generators_ros_->getSharedDataPtr()->path_heading_lookahead_ = heading_tracking_distance_;
   //@ change max speed from perception shared data framework
   trajectory_generators_ros_->getSharedDataPtr()->current_allowed_max_linear_speed_ 
                   = perception_3d_ros_->getSharedDataPtr()->current_allowed_max_linear_speed_;
 
+  traj_shared_data_ = trajectory_generators_ros_->getSharedDataPtr();
+  trajectory_generators_ros_->getSharedDataPtr()->rotation_error_ =
+    mpc_critics_ros_->getSharedDataPtr()->heading_deviation_;
+  const double alignment_error = traj_shared_data_->rotation_error_;
   trajectory_generators_ros_->initializeTheories_wi_Shared_data();
+  if (traj_gen_name != "omni_drive_simple")
+    traj_shared_data_->rotation_error_ = alignment_error;
 
   geometry_msgs::msg::PoseArray pose_arr;
   pcl::PointCloud<pcl::PointXYZ> cuboids_pcl;

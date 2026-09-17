@@ -1,3 +1,4 @@
+#include <trajectory_generators/single_axis_tracking.h>
 /*
 * BSD 3-Clause License
 
@@ -72,6 +73,12 @@ class OmniSimpleTrajectoryGeneratorTheory: public TrajectoryGeneratorTheory{
 
     unsigned int next_sample_index_;
     bool sample_braking_commands_ = false;
+    bool single_axis_tracking_ = false;
+    double axis_yaw_enter_, axis_yaw_exit_, axis_lateral_enter_, axis_lateral_exit_;
+    SingleAxisTracking axis_policy_;
+    uint64_t rotation_epoch_ = 0;
+    bool rotation_locked_ = false;
+    double rotation_heading_ = 0.0;
     // to store sample params of each sample between init and generation
     std::vector<Eigen::Vector3f> sample_params_;
 };

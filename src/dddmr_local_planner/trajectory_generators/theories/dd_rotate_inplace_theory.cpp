@@ -262,8 +262,10 @@ void DDRotateInplaceTheory::initialise(){
 
     Eigen::Vector3f vel_samp_positive = Eigen::Vector3f::Zero();
     Eigen::Vector3f vel_samp_negative = Eigen::Vector3f::Zero();
-    vel_samp_positive[2] = rotation_speed_;
-    vel_samp_negative[2] = -1.0 * rotation_speed_;
+    double speed = rotation_speed_;
+
+    vel_samp_positive[2] = speed;
+    vel_samp_negative[2] = -speed;
     if(isMotorConstraintSatisfied(vel_samp_positive)){
       sample_params_.push_back(vel_samp_positive);
     }

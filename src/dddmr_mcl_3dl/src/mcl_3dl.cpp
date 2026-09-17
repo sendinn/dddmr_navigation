@@ -139,6 +139,31 @@ bool MCL3dlNode::configure(const std::shared_ptr<mcl_3dl::SubMaps>& sub_maps)
       new MotionPredictionModelDifferentialDrive(params_->odom_err_integ_lin_tc_,
                                                   params_->odom_err_integ_ang_tc_));
 
+  odom_only_pub_ = create_publisher<std_msgs::msg::Bool>(
+    "mcl/odom_only", rclcpp::QoS(1).reliable().transient_local());
+  odom_only_pub_->publish(std_msgs::msg::Bool());
+  odom_only_service_ = create_service<std_srvs::srv::SetBool>("mcl/set_odom_only",
+    [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+           std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+      std::lock_guard<std::mutex> guard(protect_measure_in_odomcb_);
+      if (request->data && (!tf_ready_ || !has_odom_ || !params_->publish_tf_)) {
+        response->success = false;
+        response->message = "A valid map-to-odom transform is required";
+        return;
+      }
+      if (odom_only_ && !request->data) {
+        // Particles already followed odometry. Only consume scans newer than
+        // that prediction when scan matching is enabled again.
+        pcl_segmentations_.clear();
+        last_measurement_scan_ns_ = rclcpp::Time(odom_header_.stamp).nanoseconds();
+      }
+      odom_only_ = request->data;
+      std_msgs::msg::Bool state; state.data = odom_only_;
+      odom_only_pub_->publish(state);
+      response->success = true;
+      response->message = odom_only_ ? "Map-to-odom frozen; odometry only" : "MCL matching enabled";
+      RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+    });
   return true;
   /*
 
@@ -195,12 +220,22 @@ void MCL3dlNode::cbOdom(const nav_msgs::msg::Odometry::SharedPtr msg){
     has_odom_ = true;
     return;
   }
+  if (odom_only_) {
+    // Maintain the particle prior for resuming later, but never measure,
+    // resample, publish an MCL pose, or change map-to-odom during this task.
+    motion_prediction_model_->setOdoms(odom_prev_, odom_);
+    pf_->predict([this](State6DOF& state) { motion_prediction_model_->predict(state); });
+    constrainPlanarParticles();
+    odom_prev_ = odom_;
+    odom_last_ = rclcpp::Time(odom_header_.stamp);
+    return;
+  }
   updateFromLatestFeatures();
 }
 
 void MCL3dlNode::updateFromLatestFeatures()
 {
-  if (!has_odom_ || pcl_segmentations_.empty()) return;
+  if (odom_only_ || !has_odom_ || pcl_segmentations_.empty()) return;
   const int64_t scan_ns = rclcpp::Time(laser_header_.stamp).nanoseconds();
   // Every measurement must consume a distinct scan, including while moving.
   if (scan_ns <= last_measurement_scan_ns_) return;
@@ -313,7 +348,7 @@ void MCL3dlNode::cbLeGoFeatureCloud(const sensor_msgs::msg::PointCloud2::SharedP
   
   std::unique_lock<std::mutex> lock(protect_measure_in_odomcb_);
   
-  if(!sub_maps_->isCurrentReady())
+  if(odom_only_ || !sub_maps_->isCurrentReady())
     return;
 
   Eigen::Affine3d trans_b2s_af3;
@@ -771,7 +806,7 @@ void MCL3dlNode::publishTFThread()
       laser_header_.stamp = odom_header_.stamp;
       RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 3000, "Laser msg.header.timestamp = 0, use odom stamp as the timestamp");
     }
-    map2odom_trans_.header.stamp = laser_header_.stamp;
+    map2odom_trans_.header.stamp = odom_only_ ? odom_header_.stamp : laser_header_.stamp;
     tfb_->sendTransform(map2odom_trans_);
     first_tf_ = true;
   }
@@ -801,6 +836,10 @@ void MCL3dlNode::cbPosition(const geometry_msgs::msg::PoseWithCovarianceStamped:
   }
 
   std::unique_lock<std::mutex> lock(protect_measure_in_odomcb_);
+  if (odom_only_) {
+    RCLCPP_WARN(get_logger(), "Initial pose ignored during odometry-only navigation");
+    return;
+  }
   measurement_odom_initialized_ = false;
   pcl_segmentations_.clear();
   last_measurement_scan_ns_ = rclcpp::Time(odom_header_.stamp).nanoseconds();

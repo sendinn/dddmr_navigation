@@ -46,6 +46,16 @@ void OmniSimpleTrajectoryGeneratorTheory::configurateActuatorType(){
 
 void OmniSimpleTrajectoryGeneratorTheory::onInitialize(){
 
+  single_axis_tracking_ = node_->declare_parameter<bool>(name_ + ".single_axis_tracking", false);
+  axis_yaw_enter_ = node_->declare_parameter<double>(name_ + ".axis_yaw_enter", 0.1745329252);
+  axis_yaw_exit_ = node_->declare_parameter<double>(name_ + ".axis_yaw_exit", 0.0872664626);
+  axis_lateral_enter_ = node_->declare_parameter<double>(name_ + ".axis_lateral_enter", 0.10);
+  axis_lateral_exit_ = node_->declare_parameter<double>(name_ + ".axis_lateral_exit", 0.05);
+  if (!std::isfinite(axis_yaw_enter_) || !std::isfinite(axis_yaw_exit_) ||
+      !std::isfinite(axis_lateral_enter_) || !std::isfinite(axis_lateral_exit_) ||
+      axis_yaw_exit_ <= 0 || axis_yaw_enter_ <= axis_yaw_exit_ || axis_yaw_enter_ >= 1.5707963268 ||
+      axis_lateral_exit_ <= 0 || axis_lateral_enter_ <= axis_lateral_exit_)
+    throw std::invalid_argument("Invalid single-axis tracking thresholds");
   sample_braking_commands_ = node_->declare_parameter<bool>(name_ + ".sample_braking_commands", false);
   RCLCPP_INFO(node_->get_logger().get_child(name_), "sample_braking_commands: %s",
       sample_braking_commands_ ? "true" : "false");
@@ -341,6 +351,58 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
         }
       }
     }
+    if (single_axis_tracking_) {
+      std::vector<std::array<double,2>> path;
+      for (const auto& p : shared_data_->prune_plan_.poses)
+        path.push_back({p.pose.position.x, p.pose.position.y});
+      const auto& pose = shared_data_->robot_pose_.transform;
+      tf2::Quaternion q(pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w);
+      double roll, pitch, yaw;
+      tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+      auto errors = trackingErrors(path, pose.translation.x, pose.translation.y, yaw,
+                                   shared_data_->path_heading_lookahead_);
+      shared_data_->rotation_error_ = errors.heading;
+      const auto& odom = shared_data_->robot_state_;
+      const auto& v = odom.twist.twist;
+      const auto stamp = rclcpp::Time(odom.header.stamp);
+      const double age = (node_->now() - stamp).seconds();
+      const double tf_age = (node_->now() - rclcpp::Time(shared_data_->robot_pose_.header.stamp)).seconds();
+      const int axis = axis_policy_.choose(errors, {v.linear.x, v.linear.y, v.angular.z},
+        stamp.nanoseconds(), stamp.nanoseconds() > 0 && age >= 0 && age < 0.5 &&
+        tf_age >= 0 && tf_age < 0.5,
+        axis_yaw_enter_, axis_yaw_exit_, axis_lateral_enter_, axis_lateral_exit_,
+        limits_->min_vel_theta >= max_vel_th);
+      if (axis < 0) {
+        sample_params_.push_back(Eigen::Vector3f::Zero());
+      } else {
+        const int sign = axis_policy_.sign();
+        const double samples = axis == 0 ? params_->linear_x_sample :
+          axis == 1 ? params_->linear_y_sample : params_->angular_z_sample;
+        // SDK commands are targets, not velocities that must already be
+        // reachable in one 0.1 s cycle. Otherwise a startup dead zone traps
+        // sampling near zero forever. Score the complete acceleration rollout.
+        double cap = axis == 2 ? (limits_->min_vel_theta >= max_vel_th ? max_vel_th :
+          std::min(max_vel_th, std::max(0.08, std::abs(errors.heading)))) :
+                                std::max(std::abs(command_min[axis]), std::abs(command_max[axis]));
+        if (axis != 2 && limits_->max_vel_trans >= 0)
+          cap = std::min(cap, limits_->max_vel_trans);
+        if (axis != 2 && shared_data_->current_allowed_max_linear_speed_ > 0)
+          cap = std::min(cap, shared_data_->current_allowed_max_linear_speed_);
+        const double minimum = axis == 2 ? limits_->min_vel_theta : limits_->min_vel_trans;
+        const auto targets = singleAxisTargets(command_min[axis], command_max[axis],
+          minimum, static_cast<int>(samples), sign, cap);
+        for (double speed : targets) {
+          Eigen::Vector3f command = Eigen::Vector3f::Zero();
+          command[axis] = speed;
+          if (isMotorConstraintSatisfied(command)) sample_params_.push_back(command);
+        }
+      }
+      // If no legal target satisfies the direction and speed limits, brake
+      // and retry; do not return an empty set that restarts global alignment.
+      if (sample_params_.empty()) sample_params_.push_back(Eigen::Vector3f::Zero());
+      // Every sample is simulated and collision-scored with this exact command.
+      return;
+    }
     Eigen::Vector3f vel_samp = Eigen::Vector3f::Zero();
     trajectory_generators::VelocityIterator x_it(min_vel[0], max_vel[0], params_->linear_x_sample);
     trajectory_generators::VelocityIterator y_it(min_vel[1], max_vel[1], params_->linear_y_sample);
@@ -421,7 +483,7 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
 
   // make sure that the robot would at least be moving with one of
   // the required minimum velocities for translation and rotation (if set)
-  const bool braking_stop = sample_braking_commands_ && sample_target_vel.isZero(0.0f);
+  const bool braking_stop = (sample_braking_commands_ || single_axis_tracking_) && sample_target_vel.isZero(0.0f);
   if (!braking_stop && (limits_->min_vel_trans >= 0 && vmag + eps < limits_->min_vel_trans) &&
       (limits_->min_vel_theta >= 0 && fabs(sample_target_vel[2]) + eps < limits_->min_vel_theta)) {
     return false;

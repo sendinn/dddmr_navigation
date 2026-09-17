@@ -37,6 +37,19 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
 {
   name_ = name;
   clock_ = this->get_clock();
+  rotation_pulse_duration_ = declare_parameter<double>("rotation_pulse_duration", 0.0);
+  if (!std::isfinite(rotation_pulse_duration_) || rotation_pulse_duration_ < 0)
+    throw std::invalid_argument("Invalid rotation_pulse_duration");
+  rotation_predict_duration_ = declare_parameter<bool>("rotation_predict_duration", false);
+  rotation_calibration_angle_ = declare_parameter<double>("rotation_calibration_angle", 0.25051551822739304);
+  rotation_calibration_time_ = declare_parameter<double>("rotation_calibration_time", 0.5);
+  rotation_max_duration_ = declare_parameter<double>("rotation_max_duration", 2.0);
+  if (!std::isfinite(rotation_calibration_angle_) || rotation_calibration_angle_ <= 0 ||
+      !std::isfinite(rotation_calibration_time_) || rotation_calibration_time_ <= 0 ||
+      !std::isfinite(rotation_max_duration_) || rotation_max_duration_ <= 0)
+    throw std::invalid_argument("Invalid rotation calibration");
+  declare_parameter<bool>("use_mcl_during_navigation", true);
+  odom_only_client_ = create_client<std_srvs::srv::SetBool>("mcl/set_odom_only");
   localization_timeout_ = declare_parameter<double>("localization_timeout", 0.0);
   localization_resume_stable_time_ = declare_parameter<double>("localization_resume_stable_time", 1.0);
   if (!std::isfinite(localization_resume_stable_time_) || localization_resume_stable_time_ <= 0.0)
@@ -81,6 +94,7 @@ rclcpp_action::GoalResponse P2PMoveBase::handle_goal(
   std::shared_ptr<const dddmr_sys_core::action::PToPMoveBase::Goal> goal)
 {
   (void)uuid;
+  if (task_running_.exchange(true)) return rclcpp_action::GoalResponse::REJECT;
   return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
 }
 
@@ -193,6 +207,8 @@ bool P2PMoveBase::isQuaternionValid(const geometry_msgs::msg::Quaternion& q){
 }
 
 void P2PMoveBase::publishZeroVelocity(){
+  if (rotation_pulse_.active) rotation_pulse_.stop(
+    std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
   geometry_msgs::msg::Twist cmd_vel;
   cmd_vel.linear.x = 0.0;
   cmd_vel.linear.y = 0.0;
@@ -218,6 +234,46 @@ void P2PMoveBase::publishZeroVelocity(){
 }
 
 void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
+  if (rotation_predict_duration_ || rotation_pulse_duration_ > 0.0) {
+    const bool rotating = std::abs(cmd_traj.thetav_) > 1e-6;
+    const int sign = cmd_traj.thetav_ > 0 ? 1 : -1;
+    const double now = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (rotation_pulse_.active && (!rotating || sign != rotation_pulse_.sign)) {
+      publishZeroVelocity();
+      return;
+    }
+    if (rotating && !rotation_pulse_.active) {
+      const auto stamp = rclcpp::Time(robot_state_.header.stamp);
+      const double age = (clock_->now()-stamp).seconds();
+      const auto& v = robot_state_.twist.twist;
+      if (stamp.nanoseconds()<=0 || age<0 || age>=0.5 ||
+          !std::isfinite(v.linear.x) || !std::isfinite(v.linear.y) || !std::isfinite(v.angular.z) ||
+          std::hypot(v.linear.x,v.linear.y)>0.03 || std::abs(v.angular.z)>0.05) {
+        rotation_pulse_.stop(now);
+        publishZeroVelocity();
+        return;
+      }
+      rotation_active_duration_ = rotation_pulse_duration_;
+      if (rotation_predict_duration_) {
+        const double error = LP_->traj_shared_data_->rotation_error_;
+        // Calibration applies only to the measured command magnitude.
+        if (!std::isfinite(error) || error*sign <= 0 ||
+            std::abs(std::abs(cmd_traj.thetav_)-0.6)>1e-4) {
+          publishZeroVelocity();
+          RCLCPP_WARN_THROTTLE(get_logger(), *clock_, 2000,
+            "Rotation prediction rejected: requires matching direction and 0.6 rad/s scored command.");
+          return;
+        }
+        rotation_active_duration_ = predictedRotationDuration(error, rotation_calibration_angle_,
+          rotation_calibration_time_, rotation_max_duration_);
+        if (rotation_active_duration_ <= 0) { publishZeroVelocity(); return; }
+        RCLCPP_INFO(get_logger(), "Predicted rotation: error=%.2f deg, command=%.3f rad/s, duration=%.3f s, maximum=%.2f s",
+          error*180.0/std::acos(-1.0), cmd_traj.thetav_, rotation_active_duration_, rotation_max_duration_);
+      }
+      rotation_pulse_.start(now, sign);
+    }
+  }
   if (!progress_control_started_) {
     progress_control_started_ = true;
     STATE_->last_oscillation_reset_ = clock_->now();
@@ -226,6 +282,18 @@ void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
   }
 
   if(cmd_traj.actuator_type_ == dddmr_sys_core::ActuatorType::MOTOR){
+    // Report actual selected commands after the rotation/stop gates. Keep the
+    // last moving phase across brief zero commands to avoid pulse-cycle spam.
+    const int action = std::abs(cmd_traj.thetav_) > 1e-6 ? 1 :
+      std::abs(cmd_traj.yv_) > 1e-6 ? 2 :
+      cmd_traj.xv_ > 1e-6 ? 3 : cmd_traj.xv_ < -1e-6 ? 4 : 0;
+    if (action != 0 && action != last_navigation_action_) {
+      last_navigation_action_ = action;
+      const char* label = action == 1 ? "旋转对方向中…" :
+        action == 2 ? "横移回归路线中…" : action == 3 ? "前进中…" : "后退调整中…";
+      RCLCPP_INFO(get_logger(), "Navigation action: %s (vx=%.3f m/s, vy=%.3f m/s, wz=%.3f rad/s)",
+        label, cmd_traj.xv_, cmd_traj.yv_, cmd_traj.thetav_);
+    }
     geometry_msgs::msg::Twist cmd_vel;
     cmd_vel.linear.x = cmd_traj.xv_;
     cmd_vel.linear.y = cmd_traj.yv_;
@@ -255,9 +323,24 @@ void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
   }
 }
 
+bool P2PMoveBase::setOdomOnly(bool enabled) {
+  try {
+    if (!odom_only_client_->wait_for_service(std::chrono::seconds(2))) return false;
+    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+    request->data = enabled;
+    auto future = odom_only_client_->async_send_request(request);
+    if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) return false;
+    return future.get()->success;
+  } catch (const std::exception& error) {
+    RCLCPP_ERROR(get_logger(), "MCL mode service failed: %s", error.what());
+    return false;
+  }
+}
+
 void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandle<dddmr_sys_core::action::PToPMoveBase>> goal_handle)
 {
   auto result = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>();
+  auto finish_task = std::shared_ptr<void>(nullptr, [this](void*) { task_running_ = false; });
   auto move_base_goal = goal_handle->get_goal();
 
   if(!isQuaternionValid(move_base_goal->target_pose.pose.orientation)){
@@ -267,12 +350,35 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
     return;
   }
 
+  task_use_mcl_ = get_parameter("use_mcl_during_navigation").as_bool();
+  // Restore scan matching on all exits: success, cancellation, rejection, or failure.
+  auto restore_mcl = std::shared_ptr<void>(nullptr, [this, odom_only = !task_use_mcl_](void*) {
+    if (odom_only) {
+      publishZeroVelocity();
+      if (!setOdomOnly(false))
+        RCLCPP_ERROR(get_logger(), "MCL restore failed: reload navigation before the next task.");
+    }
+  });
+  if (!task_use_mcl_) {
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (localization_timeout_ <= 0 || now >= localization_valid_until_.load() || !setOdomOnly(true)) {
+      publishZeroVelocity();
+      RCLCPP_ERROR(get_logger(), "Navigation mode rejected: valid initial localization and MCL mode service required.");
+      goal_handle->abort(result);
+      return;
+    }
+    RCLCPP_INFO(get_logger(), "Odometry-only navigation: map-to-odom frozen for this task.");
+  }
   rclcpp::Rate r(STATE_->controller_frequency_);
 
   //@ if we dont initialize oscillation pose here, the first controlling entry will cause recovery behavior.
   //@ the rclcpp::Time initial are all done in FSM class
   STATE_->initialParams(LP_->getGlobalPose(), clock_->now());
   progress_control_started_ = false;
+  last_navigation_action_ = 0;
+  rotation_pulse_.reset();
+  LP_->resetRotationReference();
   localization_paused_ = false;
   localization_replanning_ = false;
   STATE_->current_goal_ = move_base_goal->target_pose;
@@ -336,7 +442,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         std::chrono::steady_clock::now().time_since_epoch()).count();
     bool localization_invalid = false;
     bool localization_recovered = false;
-    if (localization_timeout_ > 0.0) {
+    if (task_use_mcl_ && localization_timeout_ > 0.0) {
       std::lock_guard<std::mutex> guard(localization_diagnostics_mutex_);
       localization_invalid = steady_now >= localization_valid_until_.load();
       localization_recovered = localization_recovery_.ready(
@@ -359,6 +465,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       if (is_recoverying_.load()) recovery_behaviors_client_ptr_->async_cancel_all_goals();
       if (!localization_paused_) {
         localization_paused_ = true;
+        rotation_pulse_.reset();
+        LP_->resetRotationReference();
         GPM_->pause();
         recovery_behaviors_client_ptr_->async_cancel_all_goals();
         RCLCPP_WARN(get_logger(), "Localization paused: retaining goal; waiting for stable localization before replanning.");
@@ -395,6 +503,28 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 
     STATE_->global_pose_ = LP_->getGlobalPose();
     LP_->syncRobotState(robot_state_, ackermann_drive_state_);
+    if ((rotation_predict_duration_ || rotation_pulse_duration_ > 0.0) && rotation_pulse_.active) {
+      const auto stamp = rclcpp::Time(robot_state_.header.stamp);
+      const auto& v = robot_state_.twist.twist;
+      auto pulse = rotation_pulse_.poll(steady_now*1e-9, rotation_active_duration_,
+        stamp.nanoseconds(), (clock_->now()-stamp).seconds(),
+        std::hypot(v.linear.x,v.linear.y), v.angular.z);
+      if (pulse == RotationPulse::Timeout) {
+        publishZeroVelocity();
+        RCLCPP_ERROR(get_logger(), "Rotation braking timeout: aborting navigation.");
+        goal_handle->abort(std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>());
+        return true;
+      }
+      if (pulse == RotationPulse::Braking || pulse == RotationPulse::Settled) {
+        publishZeroVelocity();
+        if (pulse == RotationPulse::Settled) {
+          LP_->resetRotationReference();
+          STATE_->last_valid_control_ = clock_->now();
+          RCLCPP_INFO(get_logger(), "Rotation pulse settled: recomputing heading and cross-track error.");
+        }
+        return false;
+      }
+    }
 
     // Gait-related vertical bobbing is not forward progress on the floor.
     const double progress_xy = std::hypot(
@@ -442,6 +572,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
               plan.back().pose.position.x, plan.back().pose.position.y, plan.back().pose.position.z);
           STATE_->last_valid_plan_ = clock_->now();
           LP_->setPlan(plan);
+          LP_->resetRotationReference();
           if (localization_replanning_) {
             localization_replanning_ = false;
             RCLCPP_INFO(get_logger(), "Localization resume plan ready: continuing retained goal.");
@@ -586,6 +717,10 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         return false;
       }
       if(LP_->isGoalHeadingAligned()){
+        if (rotation_pulse_.active) {
+          publishZeroVelocity();
+          return false;  // Confirm position and yaw again after the coupled drift stops.
+        }
         RCLCPP_INFO(this->get_logger(), "Goal reach.");
         auto result = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>();
         goal_handle->succeed(result);
@@ -697,7 +832,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 
       if(PS == dddmr_sys_core::PlannerState::TRAJECTORY_FOUND){
         STATE_->last_valid_control_ = clock_->now();
-        STATE_->setDecision("d_controlling");  
+        STATE_->setDecision("d_controlling");
         publishVelocity(best_traj);
         return false;
       }
@@ -733,7 +868,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         }
         else{
           STATE_->last_valid_plan_ = clock_->now();
-          STATE_->setDecision("d_planning");  
+          STATE_->setDecision("d_controlling");
         }
         publishZeroVelocity();
         return false;
@@ -848,7 +983,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 
       if(PS == dddmr_sys_core::PlannerState::TRAJECTORY_FOUND){
         STATE_->last_valid_control_ = clock_->now();
-        STATE_->setDecision("d_controlling");  
+        STATE_->setDecision("d_controlling");
         return false;
       }
 

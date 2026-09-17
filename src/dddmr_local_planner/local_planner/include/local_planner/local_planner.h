@@ -79,6 +79,7 @@ class Local_Planner : public rclcpp::Node {
       bool isGoalReached();
       
       bool isInitialHeadingAligned();
+      void resetRotationReference();
       bool isGoalHeadingAligned();
 
       void updateGlobalPose();
@@ -87,7 +88,9 @@ class Local_Planner : public rclcpp::Node {
 
       void syncRobotState(nav_msgs::msg::Odometry& odom, ackermann_msgs::msg::AckermannDriveStamped& ackermann_drive_state);
       
-    private: 
+    private:
+      bool path_heading_locked_ = false;
+      double path_heading_ = 0.0;
       
       rclcpp::Clock::SharedPtr clock_;
 

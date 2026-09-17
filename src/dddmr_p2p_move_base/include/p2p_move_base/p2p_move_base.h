@@ -30,6 +30,8 @@
 */
 /*Debug*/
 #include <p2p_move_base/localization_recovery.h>
+#include <std_srvs/srv/set_bool.hpp>
+#include <p2p_move_base/rotation_pulse.h>
 #include <chrono>
 #include <atomic>
 #include <mutex>
@@ -116,6 +118,18 @@ class P2PMoveBase : public rclcpp::Node {
     void recovery_behaviors_client_result_callback(const rclcpp_action::ClientGoalHandle<dddmr_sys_core::action::RecoveryBehaviors>::WrappedResult & result);
     std::atomic<bool> is_recoverying_{false};
     bool enable_rotate_recovery_ = true;
+    std::atomic<bool> task_running_{false};
+    bool task_use_mcl_ = true;
+    double rotation_pulse_duration_ = 0.0;
+    bool rotation_predict_duration_ = false;
+    double rotation_calibration_angle_ = 0.25051551822739304;
+    double rotation_calibration_time_ = 0.5;
+    double rotation_max_duration_ = 2.0;
+    double rotation_active_duration_ = 0.0;
+    RotationPulse rotation_pulse_;
+    int last_navigation_action_ = 0;
+    bool setOdomOnly(bool enabled);
+    rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr odom_only_client_;
     double localization_timeout_ = 0.0;
     double localization_resume_stable_time_ = 1.0;
     LocalizationRecovery localization_recovery_;
