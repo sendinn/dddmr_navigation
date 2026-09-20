@@ -1,9 +1,22 @@
 #include <trajectory_generators/single_axis_tracking.h>
 #include <cassert>
+#include <dddmr_sys_core/motion_timestamp.h>
+#include <trajectory_generators/rotation_speed.h>
 #include <string>
 using namespace trajectory_generators;
 int main() {
   const double pi = std::acos(-1.0);
+  assert(rotationSpeed(pi/2, .12, .6) == .6);
+  assert(std::abs(rotationSpeed(pi/6, .12, .6) - pi/6) < 1e-9);
+  assert(std::abs(rotationSpeed(-pi/9, .12, .6) - pi/9) < 1e-9);
+  assert(rotationSpeed(.01, .12, .6) == .12);
+  assert(rotationSpeed(NAN, .12, .6) == 0);
+  double previous = .6;
+  for (double angle = 1.5; angle >= 0; angle -= .01) {
+    const double speed = rotationSpeed(angle, .12, .6);
+    assert(speed <= previous && speed >= .12 && speed <= .6);
+    previous = speed;
+  }
   auto e = trackingErrors({{0,0},{2,0}}, 0.5, 0.3, 0);
   assert(e.valid && std::abs(e.lateral+0.3)<1e-9 && e.forward>0);
   auto rotated = trackingErrors({{0,0},{0,2}}, 0.3, 0.5, pi/2);
@@ -85,4 +98,44 @@ int main() {
   assert(choose(e,{0,0,0})==-1);
   assert(choose(e,{0,0,0})==-1);
   assert(choose(e,{0,0,0})==2 && policy.sign()==-1);
+  // Replay the small future ages observed during straight-line motion.
+  using dddmr_sys_core::motionTimestampFresh;
+  assert(motionTimestampFresh(1, -.020));
+  assert(!motionTimestampFresh(1, -.020001));
+  assert(motionTimestampFresh(1, .499));
+  assert(!motionTimestampFresh(1, .5));
+  assert(!motionTimestampFresh(0, 0));
+  assert(!motionTimestampFresh(-1, 0));
+  assert(!motionTimestampFresh(1, NAN));
+  assert(!motionTimestampFresh(1, INFINITY));
+  SingleAxisTracking jitter;
+  TrackingErrors straight{true, 0, 0, 1};
+  int64_t tick = 100;
+  auto sample = [&](double age, double vx=0) {
+    ++tick;
+    return jitter.choose(straight, {vx,0,0}, tick,
+      motionTimestampFresh(tick, age), .52,.17,.3,.15);
+  };
+  assert(sample(0)==-1);
+  assert(sample(-.013)==-1);
+  assert(sample(-.005)==0);
+  for (double age : {-.013, .01, -.005, -.003, -.012, -.001})
+    assert(sample(age, .255)==0);
+  assert(sample(-.021, .255)==-1);
+  assert(sample(0, .255)==-1);
+  assert(sample(0)==-1);
+  assert(sample(-.013)==-1);
+  assert(sample(0)==0);
+  assert(sample(.5, .255)==-1);
+  assert(sample(0)==-1);
+  assert(sample(0)==-1);
+  tick -= 10;
+  assert(sample(0)==-1);
+  assert(std::string(jitter.stopReason()).find("倒退") != std::string::npos);
+  assert(sample(0)==-1);
+  assert(jitter.choose(straight,{0,0,0},tick,true,.52,.17,.3,.15)==-1);
+  assert(sample(0)==-1);
+  assert(sample(0)==0);
+  tick -= 10;
+  assert(sample(0,.255)==-1);
 }

@@ -1,3 +1,4 @@
+#include <dddmr_sys_core/motion_timestamp.h>
 /*
 * BSD 3-Clause License
 
@@ -365,18 +366,22 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
       const auto& odom = shared_data_->robot_state_;
       const auto& v = odom.twist.twist;
       const auto stamp = rclcpp::Time(odom.header.stamp);
-      const double age = (node_->now() - stamp).seconds();
-      const double tf_age = (node_->now() - rclcpp::Time(shared_data_->robot_pose_.header.stamp)).seconds();
+      const auto now = node_->now();
+      const auto tf_stamp = rclcpp::Time(shared_data_->robot_pose_.header.stamp);
+      const double age = (now - stamp).seconds();
+      const double tf_age = (now - tf_stamp).seconds();
       const int axis = axis_policy_.choose(errors, {v.linear.x, v.linear.y, v.angular.z},
-        stamp.nanoseconds(), stamp.nanoseconds() > 0 && age >= 0 && age < 0.5 &&
-        tf_age >= 0 && tf_age < 0.5,
+        stamp.nanoseconds(), dddmr_sys_core::motionTimestampFresh(stamp.nanoseconds(), age) &&
+        dddmr_sys_core::motionTimestampFresh(tf_stamp.nanoseconds(), tf_age),
         axis_yaw_enter_, axis_yaw_exit_, axis_lateral_enter_, axis_lateral_exit_,
-        limits_->min_vel_theta >= max_vel_th);
+        true);  // Same-turn translational coupling also applies during slowdown.
       if (axis < 0) {
         RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-          "停车原因：%s; heading_error=%.4f rad, lateral_error=%.4f m, forward_error=%.4f m, measured=(%.4f,%.4f,%.4f), odom_age=%.3f s, tf_age=%.3f s",
+          "停车原因：%s; heading_error=%.4f rad, lateral_error=%.4f m, forward_error=%.4f m, measured=(%.4f,%.4f,%.4f), odom_age=%.3f s, tf_age=%.3f s, robot_yaw=%.4f rad, reference=(%.3f,%.3f)->(%.3f,%.3f), path_points=%zu",
           axis_policy_.stopReason(), errors.heading, errors.lateral, errors.forward,
-          v.linear.x, v.linear.y, v.angular.z, age, tf_age);
+          v.linear.x, v.linear.y, v.angular.z, age, tf_age, yaw,
+          errors.reference_start[0], errors.reference_start[1],
+          errors.reference_end[0], errors.reference_end[1], path.size());
         sample_params_.push_back(Eigen::Vector3f::Zero());
       } else {
         const int sign = axis_policy_.sign();
@@ -386,13 +391,18 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
         // reachable in one 0.1 s cycle. Otherwise a startup dead zone traps
         // sampling near zero forever. Score the complete acceleration rollout.
         double cap = axis == 2 ? (limits_->min_vel_theta >= max_vel_th ? max_vel_th :
-          std::min(max_vel_th, std::max(0.08, std::abs(errors.heading)))) :
+          std::min(max_vel_th, std::max(limits_->min_vel_theta, std::abs(errors.heading)))) :
                                 std::max(std::abs(command_min[axis]), std::abs(command_max[axis]));
         if (axis != 2 && limits_->max_vel_trans >= 0)
           cap = std::min(cap, limits_->max_vel_trans);
         if (axis != 2 && shared_data_->current_allowed_max_linear_speed_ > 0)
           cap = std::min(cap, shared_data_->current_allowed_max_linear_speed_);
         const double minimum = axis == 2 ? limits_->min_vel_theta : limits_->min_vel_trans;
+        if (axis == 2) {
+          RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+            "旋转减速：剩余角度=%.2f deg, 候选角速度上限=%.3f rad/s",
+            errors.heading * 180.0 / std::acos(-1.0), cap);
+        }
         const auto targets = singleAxisTargets(command_min[axis], command_max[axis],
           minimum, static_cast<int>(samples), sign, cap);
         for (double speed : targets) {

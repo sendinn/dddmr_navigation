@@ -61,6 +61,8 @@ class DDRotateInplaceTheory: public TrajectoryGeneratorTheory{
         const Eigen::Vector3f& vel, double dt);
 
     double rotation_speed_;
+    bool rotation_slowdown_;
+    double rotation_min_speed_, rotation_gain_;
     
   protected:
 

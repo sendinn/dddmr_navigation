@@ -1,4 +1,5 @@
 #pragma once
+#include <dddmr_sys_core/motion_timestamp.h>
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
@@ -29,7 +30,7 @@ class RotationPulse {
     if (!braking_ && now-start_ >= duration) stop(now);
     if (!braking_) return Turning;
     if (now-stop_ >= 5.0) return Timeout;
-    bool stopped = stamp>0 && age>=0 && age<0.5 && std::isfinite(speed) &&
+    bool stopped = dddmr_sys_core::motionTimestampFresh(stamp, age) && std::isfinite(speed) &&
       std::isfinite(yaw_rate) && speed<=0.03 && std::abs(yaw_rate)<=0.05;
     if (!stopped || stamp<stamp_) count_=0;
     else if (stamp>stamp_) ++count_;

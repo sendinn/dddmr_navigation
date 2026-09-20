@@ -214,6 +214,8 @@ void MultiLayerSpinningLidar::transformToPlaneEquation(
 
 void MultiLayerSpinningLidar::cbSensor(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 { 
+  const auto received = clock_->now();
+  const auto processing_begin = std::chrono::steady_clock::now();
 
   //@Protect Mark/Clear functions
   std::unique_lock<std::recursive_mutex> lock(shared_data_->ground_kdtree_cb_mutex_);
@@ -223,7 +225,7 @@ void MultiLayerSpinningLidar::cbSensor(const sensor_msgs::msg::PointCloud2::Shar
   rclcpp::Time time2(msg->header.stamp);
   rclcpp::Duration diff = time2 - time1;
   double seconds_between_expectation = fabs(diff.seconds() - expected_sensor_time_);
-  last_sensor_receiving_time_ = msg->header;
+
   if(time1.nanoseconds() != 0 && seconds_between_expectation>0.05 && diff.seconds()>expected_sensor_time_){
     RCLCPP_WARN_THROTTLE(node_->get_logger().get_child(name_), 
         *clock_, 1000, "Sensor frame gap: topic=%s, stamp_interval=%.3f s, message_age=%.3f s, timeout=%.3f s",
@@ -327,6 +329,17 @@ void MultiLayerSpinningLidar::cbSensor(const sensor_msgs::msg::PointCloud2::Shar
 
   //@ update time
   last_observation_time_ = clock_->now();
+  // Only successfully transformed/filtered observations may refresh freshness.
+  last_sensor_receiving_time_ = msg->header;
+  const double processing_seconds = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - processing_begin).count();
+  const double arrival_age = (received - time2).seconds();
+  if (processing_seconds > 0.1 || arrival_age > 0.3) {
+    RCLCPP_WARN_THROTTLE(node_->get_logger().get_child(name_), *clock_, 1000,
+      "Perception latency: topic=%s, arrival_age=%.3f s, processing_and_lock=%.3f s, output_age=%.3f s",
+      topic_.c_str(), arrival_age, processing_seconds,
+      (last_observation_time_ - time2).seconds());
+  }
 
   if(pub_current_observation_->get_subscription_count()>0){
     sensor_msgs::msg::PointCloud2 ros_pc2_msg;

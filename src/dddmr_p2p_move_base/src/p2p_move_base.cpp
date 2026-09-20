@@ -1,3 +1,4 @@
+#include <dddmr_sys_core/motion_timestamp.h>
 /*
 * BSD 3-Clause License
 
@@ -254,7 +255,7 @@ void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
       const auto stamp = rclcpp::Time(robot_state_.header.stamp);
       const double age = (clock_->now()-stamp).seconds();
       const auto& v = robot_state_.twist.twist;
-      if (stamp.nanoseconds()<=0 || age<0 || age>=0.5 ||
+      if (!dddmr_sys_core::motionTimestampFresh(stamp.nanoseconds(), age) ||
           !std::isfinite(v.linear.x) || !std::isfinite(v.linear.y) || !std::isfinite(v.angular.z) ||
           std::hypot(v.linear.x,v.linear.y)>0.03 || std::abs(v.angular.z)>0.05) {
         rotation_pulse_.stop(now);
@@ -700,10 +701,10 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       const double age = (clock_->now() - stamp).seconds();
       const auto& velocity = robot_state_.twist.twist;
       const double speed = std::hypot(velocity.linear.x, velocity.linear.y);
-      const bool stopped = stamp.nanoseconds() > 0 && age >= 0.0 && age <= 0.5 &&
+      const bool stopped = dddmr_sys_core::motionTimestampFresh(stamp.nanoseconds(), age) &&
           std::isfinite(speed) && std::isfinite(velocity.angular.z) &&
           speed <= 0.03 && std::abs(velocity.angular.z) <= 0.05;
-      if (!stopped) heading_stopped_samples_ = 0;
+      if (!stopped || stamp.nanoseconds() < heading_last_odom_stamp_) heading_stopped_samples_ = 0;
       else if (stamp.nanoseconds() > heading_last_odom_stamp_) ++heading_stopped_samples_;
       heading_last_odom_stamp_ = stamp.nanoseconds();
       if (elapsed >= 5.0) {

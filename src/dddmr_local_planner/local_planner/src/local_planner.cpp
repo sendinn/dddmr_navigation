@@ -358,11 +358,10 @@ geometry_msgs::msg::TransformStamped Local_Planner::getGlobalPose(){
 
 void Local_Planner::prunePlan(double forward_distance, double backward_distance){
 
-  if(pcl_global_plan_->points.size()<3)
-    return;
-
   prune_plan_.poses.clear();
   pcl_prune_plan_.clear();
+  if(pcl_global_plan_->points.size()<3)
+    return;
 
   std::vector<int> pointIdxNKNSearch(1);
   std::vector<float> pointNKNSquaredDistance(1);

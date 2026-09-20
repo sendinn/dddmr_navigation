@@ -29,6 +29,8 @@
 * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #include <trajectory_generators/dd_rotate_inplace_theory.h>
+#include <trajectory_generators/rotation_speed.h>
+#include <stdexcept>
 
 PLUGINLIB_EXPORT_CLASS(trajectory_generators::DDRotateInplaceTheory, trajectory_generators::TrajectoryGeneratorTheory)
 
@@ -131,6 +133,13 @@ void DDRotateInplaceTheory::onInitialize(){
   node_->declare_parameter(name_ + ".rotation_speed", rclcpp::ParameterValue(0.4));
   node_->get_parameter(name_ + ".rotation_speed", rotation_speed_);
   RCLCPP_INFO(node_->get_logger().get_child(name_), "rotation_speed: %.2f", rotation_speed_);
+  rotation_slowdown_ = node_->declare_parameter<bool>(name_ + ".rotation_slowdown", false);
+  rotation_min_speed_ = node_->declare_parameter<double>(name_ + ".rotation_min_speed", 0.12);
+  rotation_gain_ = node_->declare_parameter<double>(name_ + ".rotation_gain", 1.0);
+  if (rotation_slowdown_ && (!std::isfinite(rotation_speed_) ||
+      !std::isfinite(rotation_min_speed_) || !std::isfinite(rotation_gain_) ||
+      rotation_min_speed_ <= 0 || rotation_speed_ < rotation_min_speed_ || rotation_gain_ <= 0))
+    throw std::invalid_argument("Invalid rotation slowdown limits/gain");
 
   //@ parse cuboid
   /*
@@ -263,6 +272,14 @@ void DDRotateInplaceTheory::initialise(){
     Eigen::Vector3f vel_samp_positive = Eigen::Vector3f::Zero();
     Eigen::Vector3f vel_samp_negative = Eigen::Vector3f::Zero();
     double speed = rotation_speed_;
+    if (rotation_slowdown_) {
+      const double error = shared_data_->rotation_error_;
+      if (!std::isfinite(error)) return;  // No valid scored command without an angle.
+      speed = rotationSpeed(error, rotation_min_speed_, rotation_speed_, rotation_gain_);
+      RCLCPP_INFO_THROTTLE(node_->get_logger().get_child(name_), *node_->get_clock(), 1000,
+        "旋转减速：剩余角度=%.2f deg, 候选角速度=+/-%.3f rad/s",
+        error * 180.0 / std::acos(-1.0), speed);
+    }
 
     vel_samp_positive[2] = speed;
     vel_samp_negative[2] = -speed;

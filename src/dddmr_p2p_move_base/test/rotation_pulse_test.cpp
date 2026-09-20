@@ -42,4 +42,18 @@ int main() {
   assert(p.poll(13.5,10,19,0,0,0,true)==RotationPulse::Settled);
   p.start(20,-1);
   assert(p.poll(30,10,20,0,0,.6,true)==RotationPulse::Timeout);
+  p.reset(); p.stop(40);
+  assert(p.poll(40.1,1,100,-.013,0,0)==RotationPulse::Braking);
+  assert(p.poll(40.2,1,101,-.005,0,0)==RotationPulse::Braking);
+  assert(p.poll(40.3,1,102,-.012,0,0)==RotationPulse::Settled);
+  p.stop(41);
+  assert(p.poll(41.1,1,103,0,0,0)==RotationPulse::Braking);
+  assert(p.poll(41.2,1,104,-.021,0,0)==RotationPulse::Braking);
+  assert(p.poll(41.3,1,105,0,0,0)==RotationPulse::Braking);
+  assert(p.poll(41.4,1,106,0,0,0)==RotationPulse::Braking);
+  assert(p.poll(41.5,1,90,0,0,0)==RotationPulse::Braking);
+  assert(p.poll(41.6,1,91,0,0,0)==RotationPulse::Braking);
+  assert(p.poll(41.7,1,91,0,0,0)==RotationPulse::Braking);
+  assert(p.poll(41.8,1,92,0,0,0)==RotationPulse::Braking);
+  assert(p.poll(41.9,1,93,-.001,0,0)==RotationPulse::Settled);
 }

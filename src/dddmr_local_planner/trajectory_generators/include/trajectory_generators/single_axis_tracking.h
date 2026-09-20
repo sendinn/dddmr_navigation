@@ -10,6 +10,7 @@ namespace trajectory_generators {
 struct TrackingErrors {
   bool valid = false;
   double heading = 0, lateral = 0, forward = 0;
+  std::array<double,2> reference_start{}, reference_end{};
 };
 // Use an ordered forward arc window, not the nearest tiny connector tangent.
 // The same reference line supplies heading and cross-track error.
@@ -53,6 +54,8 @@ inline TrackingErrors trackingErrors(const std::vector<std::array<double, 2>>& p
   const double dx = b[0]-a[0], dy = b[1]-a[1], length = std::hypot(dx,dy);
   // A folded/degenerate window has no reliable forward direction: brake.
   if (length < 1e-6) return out;
+  out.reference_start = a;
+  out.reference_end = b;
   out.valid = true;
   out.heading = std::atan2(std::sin(std::atan2(dy,dx)-yaw),
                            std::cos(std::atan2(dy,dx)-yaw));
@@ -87,7 +90,13 @@ class SingleAxisTracking {
         !std::isfinite(e.heading) || !std::isfinite(e.lateral)) {
       stop_reason_ = "路径跟踪误差无效"; return reset();
     }
-    if (!fresh) { stop_reason_ = "里程计或 TF 过期/时间异常"; return reset(); }
+    if (!fresh || stamp <= 0) { stop_reason_ = "里程计或 TF 过期/时间异常"; return reset(); }
+    if (stamp < last_stamp_) {
+      stop_reason_ = "里程计时间戳倒退，重新确认停稳";
+      reset();
+      last_stamp_ = stamp;
+      return -1;
+    }
     for (double v : velocity) if (!std::isfinite(v)) {
       stop_reason_ = "实测速度无效"; return reset();
     }
