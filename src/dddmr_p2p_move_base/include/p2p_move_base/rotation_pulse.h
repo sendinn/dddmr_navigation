@@ -20,8 +20,12 @@ class RotationPulse {
   void start(double now, int direction) { active=true; sign=direction; start_=now; braking_=false; count_=0; stamp_=0; }
   void stop(double now) { if (!active) start(now,0); if (!braking_) { braking_=true; stop_=now; count_=0; stamp_=0; } }
   void reset() { active=false; braking_=false; count_=0; sign=0; }
-  Result poll(double now, double duration, int64_t stamp, double age, double speed, double yaw_rate) {
+  Result poll(double now, double duration, int64_t stamp, double age, double speed, double yaw_rate,
+              bool angle_feedback = false) {
     if (!active) return Idle;
+    // In feedback mode the planner calls stop() on angle convergence. Time
+    // is only an abort watchdog, never a substitute for reaching the angle.
+    if (!braking_ && angle_feedback && now-start_ >= duration) return Timeout;
     if (!braking_ && now-start_ >= duration) stop(now);
     if (!braking_) return Turning;
     if (now-stop_ >= 5.0) return Timeout;

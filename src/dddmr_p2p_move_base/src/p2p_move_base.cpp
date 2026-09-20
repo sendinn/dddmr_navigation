@@ -41,6 +41,10 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
   if (!std::isfinite(rotation_pulse_duration_) || rotation_pulse_duration_ < 0)
     throw std::invalid_argument("Invalid rotation_pulse_duration");
   rotation_predict_duration_ = declare_parameter<bool>("rotation_predict_duration", false);
+  rotation_angle_feedback_ = declare_parameter<bool>("rotation_angle_feedback", false);
+  rotation_feedback_timeout_ = declare_parameter<double>("rotation_feedback_timeout", 10.0);
+  if (!std::isfinite(rotation_feedback_timeout_) || rotation_feedback_timeout_ <= 0)
+    throw std::invalid_argument("Invalid rotation_feedback_timeout");
   rotation_calibration_angle_ = declare_parameter<double>("rotation_calibration_angle", 0.25051551822739304);
   rotation_calibration_time_ = declare_parameter<double>("rotation_calibration_time", 0.5);
   rotation_max_duration_ = declare_parameter<double>("rotation_max_duration", 2.0);
@@ -234,7 +238,7 @@ void P2PMoveBase::publishZeroVelocity(){
 }
 
 void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
-  if (rotation_predict_duration_ || rotation_pulse_duration_ > 0.0) {
+  if (rotation_angle_feedback_ || rotation_predict_duration_ || rotation_pulse_duration_ > 0.0) {
     const bool rotating = std::abs(cmd_traj.thetav_) > 1e-6;
     const int sign = cmd_traj.thetav_ > 0 ? 1 : -1;
     const double now = std::chrono::duration<double>(
@@ -254,8 +258,9 @@ void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
         publishZeroVelocity();
         return;
       }
-      rotation_active_duration_ = rotation_pulse_duration_;
-      if (rotation_predict_duration_) {
+      rotation_active_duration_ = rotation_angle_feedback_
+        ? rotation_feedback_timeout_ : rotation_pulse_duration_;
+      if (rotation_predict_duration_ && !rotation_angle_feedback_) {
         const double error = LP_->traj_shared_data_->rotation_error_;
         // Calibration applies only to the measured command magnitude.
         if (!std::isfinite(error) || error*sign <= 0 ||
@@ -503,15 +508,15 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 
     STATE_->global_pose_ = LP_->getGlobalPose();
     LP_->syncRobotState(robot_state_, ackermann_drive_state_);
-    if ((rotation_predict_duration_ || rotation_pulse_duration_ > 0.0) && rotation_pulse_.active) {
+    if ((rotation_angle_feedback_ || rotation_predict_duration_ || rotation_pulse_duration_ > 0.0) && rotation_pulse_.active) {
       const auto stamp = rclcpp::Time(robot_state_.header.stamp);
       const auto& v = robot_state_.twist.twist;
       auto pulse = rotation_pulse_.poll(steady_now*1e-9, rotation_active_duration_,
         stamp.nanoseconds(), (clock_->now()-stamp).seconds(),
-        std::hypot(v.linear.x,v.linear.y), v.angular.z);
+        std::hypot(v.linear.x,v.linear.y), v.angular.z, rotation_angle_feedback_);
       if (pulse == RotationPulse::Timeout) {
         publishZeroVelocity();
-        RCLCPP_ERROR(get_logger(), "Rotation braking timeout: aborting navigation.");
+        RCLCPP_ERROR(get_logger(), "Rotation/settling timeout: aborting navigation.");
         goal_handle->abort(std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>());
         return true;
       }

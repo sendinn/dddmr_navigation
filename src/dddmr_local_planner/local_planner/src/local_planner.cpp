@@ -250,7 +250,7 @@ bool Local_Planner::isInitialHeadingAligned(){
     path, pose.translation.x, pose.translation.y, yaw, heading_tracking_distance_);
   if (!errors.valid) return false;
   mpc_critics_ros_->getSharedDataPtr()->heading_deviation_ = errors.heading;
-  return std::abs(errors.heading) < heading_align_angle_;
+  return std::abs(errors.heading) <= heading_align_angle_;
 }
 
 bool Local_Planner::isGoalHeadingAligned(){

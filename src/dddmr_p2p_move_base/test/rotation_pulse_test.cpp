@@ -32,4 +32,14 @@ int main() {
   assert(p.poll(8.1,.25,11,0,0,0)==RotationPulse::Braking);
   assert(p.poll(8.2,.25,12,0,0,0)==RotationPulse::Braking);
   assert(p.poll(8.3,.25,13,0,0,0)==RotationPulse::Settled);
+  p.start(10,1);
+  assert(p.poll(10.5,10,14,0,0,.6,true)==RotationPulse::Turning);
+  assert(p.poll(13,10,15,0,0,.6,true)==RotationPulse::Turning);
+  p.stop(13.1); // Planner reached angular tolerance; issue zero immediately.
+  assert(p.poll(13.2,10,16,0,0,.2,true)==RotationPulse::Braking);
+  assert(p.poll(13.3,10,17,0,0,0,true)==RotationPulse::Braking);
+  assert(p.poll(13.4,10,18,0,0,0,true)==RotationPulse::Braking);
+  assert(p.poll(13.5,10,19,0,0,0,true)==RotationPulse::Settled);
+  p.start(20,-1);
+  assert(p.poll(30,10,20,0,0,.6,true)==RotationPulse::Timeout);
 }

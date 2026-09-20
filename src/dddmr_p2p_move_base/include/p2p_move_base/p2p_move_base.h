@@ -122,6 +122,8 @@ class P2PMoveBase : public rclcpp::Node {
     bool task_use_mcl_ = true;
     double rotation_pulse_duration_ = 0.0;
     bool rotation_predict_duration_ = false;
+    bool rotation_angle_feedback_ = false;
+    double rotation_feedback_timeout_ = 10.0;
     double rotation_calibration_angle_ = 0.25051551822739304;
     double rotation_calibration_time_ = 0.5;
     double rotation_max_duration_ = 2.0;
