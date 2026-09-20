@@ -1,5 +1,6 @@
 #include <trajectory_generators/single_axis_tracking.h>
 #include <cassert>
+#include <string>
 using namespace trajectory_generators;
 int main() {
   const double pi = std::acos(-1.0);
@@ -74,11 +75,13 @@ int main() {
   e.heading=.3;
   assert(choose(e,{.08,0,0})==-1); // New corner preempts X, but brakes first.
   assert(choose(e,{0,0,0},false)==-1); // Stale odom resets stage.
+  assert(std::string(policy.stopReason()).find("TF") != std::string::npos);
   assert(choose(e,{0,0,0})==-1);
   assert(choose(e,{0,0,0})==-1);
   assert(choose(e,{0,0,0})==2);
   e.heading=-.3;
   assert(choose(e,{0,0,.1})==-1); // Direction reversal also waits for stop.
+  assert(std::string(policy.stopReason()).find("切换轴或方向") != std::string::npos);
   assert(choose(e,{0,0,0})==-1);
   assert(choose(e,{0,0,0})==-1);
   assert(choose(e,{0,0,0})==2 && policy.sign()==-1);

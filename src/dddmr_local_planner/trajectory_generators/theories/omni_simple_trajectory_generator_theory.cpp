@@ -373,6 +373,10 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
         axis_yaw_enter_, axis_yaw_exit_, axis_lateral_enter_, axis_lateral_exit_,
         limits_->min_vel_theta >= max_vel_th);
       if (axis < 0) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+          "停车原因：%s; heading_error=%.4f rad, lateral_error=%.4f m, forward_error=%.4f m, measured=(%.4f,%.4f,%.4f), odom_age=%.3f s, tf_age=%.3f s",
+          axis_policy_.stopReason(), errors.heading, errors.lateral, errors.forward,
+          v.linear.x, v.linear.y, v.angular.z, age, tf_age);
         sample_params_.push_back(Eigen::Vector3f::Zero());
       } else {
         const int sign = axis_policy_.sign();
@@ -399,7 +403,11 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
       }
       // If no legal target satisfies the direction and speed limits, brake
       // and retry; do not return an empty set that restarts global alignment.
-      if (sample_params_.empty()) sample_params_.push_back(Eigen::Vector3f::Zero());
+      if (sample_params_.empty()) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+          "停车原因：当前轴/方向没有满足速度限制的采样; axis=%d, sign=%d", axis, axis_policy_.sign());
+        sample_params_.push_back(Eigen::Vector3f::Zero());
+      }
       // Every sample is simulated and collision-scored with this exact command.
       return;
     }

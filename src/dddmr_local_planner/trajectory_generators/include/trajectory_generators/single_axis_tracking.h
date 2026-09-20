@@ -83,9 +83,14 @@ class SingleAxisTracking {
   int choose(const TrackingErrors& e, const std::array<double,3>& velocity,
              int64_t stamp, bool fresh, double yaw_enter, double yaw_exit,
              double lateral_enter, double lateral_exit, bool allow_yaw_translation = false) {
-    if (!e.valid || !fresh || !std::isfinite(e.forward) ||
-        !std::isfinite(e.heading) || !std::isfinite(e.lateral)) return reset();
-    for (double v : velocity) if (!std::isfinite(v)) return reset();
+    if (!e.valid || !std::isfinite(e.forward) ||
+        !std::isfinite(e.heading) || !std::isfinite(e.lateral)) {
+      stop_reason_ = "路径跟踪误差无效"; return reset();
+    }
+    if (!fresh) { stop_reason_ = "里程计或 TF 过期/时间异常"; return reset(); }
+    for (double v : velocity) if (!std::isfinite(v)) {
+      stop_reason_ = "实测速度无效"; return reset();
+    }
     if (std::abs(e.heading) > yaw_enter) rotating_ = true;
     else if (std::abs(e.heading) <= yaw_exit) rotating_ = false;
     if (std::abs(e.lateral) > lateral_enter) lateral_ = true;
@@ -107,15 +112,21 @@ class SingleAxisTracking {
       pending_ = wanted; pending_sign_ = sign;
       if (stopped && stamp > last_stamp_) ++count_;
       last_stamp_ = stamp;
-      if (count_ < 3) return -1;
+      if (count_ < 3) {
+        stop_reason_ = other_moving ? "非目标轴仍在运动，等待停稳" :
+          !stopped ? "切换轴或方向，等待停稳" : "等待三个新里程计样本确认停稳";
+        return -1;
+      }
       active_ = wanted; sign_ = sign;
     }
     count_ = 0;
     last_stamp_ = stamp;
     return wanted;
   }
+  const char* stopReason() const { return stop_reason_; }
   int sign() const { return sign_; }
  private:
+  const char* stop_reason_ = "等待单轴跟踪初始化";
   int reset() { active_ = -1; pending_ = -1; count_ = 0; last_stamp_ = 0;
                 rotating_ = lateral_ = false; return -1; }
   bool rotating_ = false, lateral_ = false;

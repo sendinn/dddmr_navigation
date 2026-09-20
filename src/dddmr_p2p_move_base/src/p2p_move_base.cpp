@@ -210,7 +210,10 @@ bool P2PMoveBase::isQuaternionValid(const geometry_msgs::msg::Quaternion& q){
   return true;
 }
 
-void P2PMoveBase::publishZeroVelocity(){
+void P2PMoveBase::publishZeroVelocity(const char* reason, int source_line){
+  RCLCPP_WARN_THROTTLE(get_logger(), *clock_, 1000,
+    "停车原因：%s; state=%s, source=p2p_move_base.cpp:%d",
+    reason, STATE_->getCurrentDecision().c_str(), source_line);
   if (rotation_pulse_.active) rotation_pulse_.stop(
     std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
   geometry_msgs::msg::Twist cmd_vel;
@@ -244,7 +247,7 @@ void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
     const double now = std::chrono::duration<double>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
     if (rotation_pulse_.active && (!rotating || sign != rotation_pulse_.sign)) {
-      publishZeroVelocity();
+      publishZeroVelocity("旋转结束或方向切换，先制动");
       return;
     }
     if (rotating && !rotation_pulse_.active) {
@@ -255,7 +258,7 @@ void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
           !std::isfinite(v.linear.x) || !std::isfinite(v.linear.y) || !std::isfinite(v.angular.z) ||
           std::hypot(v.linear.x,v.linear.y)>0.03 || std::abs(v.angular.z)>0.05) {
         rotation_pulse_.stop(now);
-        publishZeroVelocity();
+        publishZeroVelocity("旋转前实测速度未停稳或里程计过期");
         return;
       }
       rotation_active_duration_ = rotation_angle_feedback_
@@ -292,6 +295,11 @@ void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
     const int action = std::abs(cmd_traj.thetav_) > 1e-6 ? 1 :
       std::abs(cmd_traj.yv_) > 1e-6 ? 2 :
       cmd_traj.xv_ > 1e-6 ? 3 : cmd_traj.xv_ < -1e-6 ? 4 : 0;
+    if (action == 0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *clock_, 1000,
+        "停车原因：局部规划器选中零速度轨迹；查看 trajectory_generators 的停车诊断; state=%s",
+        STATE_->getCurrentDecision().c_str());
+    }
     if (action != 0 && action != last_navigation_action_) {
       last_navigation_action_ = action;
       const char* label = action == 1 ? "旋转对方向中…" :
@@ -632,23 +640,23 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         }
         else if(PS == dddmr_sys_core::PlannerState::PERCEPTION_MALFUNCTION){
           RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Sensor data is out of date, we're not going to allow commanding of the base for safety");
-          publishZeroVelocity();
+          publishZeroVelocity("感知数据过期或异常");
           return false;
         }
         else if(PS == dddmr_sys_core::PlannerState::CONFIGURATION_ERROR){
           RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Configuration error, check your yaml and logs.");
-          publishZeroVelocity();
+          publishZeroVelocity("局部规划器配置错误");
           return false;
         }
         else if(PS == dddmr_sys_core::PlannerState::TF_FAIL){
           RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Detect TF fail in local planner, we're not going to allow commanding of the base for safety");
-          publishZeroVelocity();
+          publishZeroVelocity("局部规划器缺少有效里程计或 TF");
           return false;
         }
         else if(PS == dddmr_sys_core::PlannerState::PRUNE_PLAN_FAIL){
           //@ this assignment will allow at least one time planning query
           STATE_->last_valid_plan_ = clock_->now();
-          publishZeroVelocity();
+          publishZeroVelocity("路径裁剪失败，等待重新规划");
           STATE_->setDecision("d_planning");  
           return false;
         }
@@ -664,7 +672,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
             STATE_->last_valid_plan_ = clock_->now();
             STATE_->setDecision("d_planning");  
           }
-          publishZeroVelocity();
+          publishZeroVelocity("全部局部轨迹被拒绝，等待重试");
           return false;
         }
 
@@ -754,23 +762,23 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         }
         else if(PS == dddmr_sys_core::PlannerState::PERCEPTION_MALFUNCTION){
           RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Sensor data is out of date, we're not going to allow commanding of the base for safety");
-          publishZeroVelocity();
+          publishZeroVelocity("感知数据过期或异常");
           return false;
         }
         else if(PS == dddmr_sys_core::PlannerState::CONFIGURATION_ERROR){
           RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Configuration error, check your yaml and logs.");
-          publishZeroVelocity();
+          publishZeroVelocity("局部规划器配置错误");
           return false;
         }
         else if(PS == dddmr_sys_core::PlannerState::TF_FAIL){
           RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Detect TF fail in local planner, we're not going to allow commanding of the base for safety");
-          publishZeroVelocity();
+          publishZeroVelocity("局部规划器缺少有效里程计或 TF");
           return false;
         }
         else if(PS == dddmr_sys_core::PlannerState::PRUNE_PLAN_FAIL){
           //@ this assignment will allow at least one time planning query
           STATE_->last_valid_plan_ = clock_->now();
-          publishZeroVelocity();
+          publishZeroVelocity("路径裁剪失败，等待重新规划");
           STATE_->setDecision("d_planning");  
           return false;
         }
@@ -843,23 +851,23 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       }
       else if(PS == dddmr_sys_core::PlannerState::PERCEPTION_MALFUNCTION){
         RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Sensor data is out of date, we're not going to allow commanding of the base for safety");
-        publishZeroVelocity();
+        publishZeroVelocity("感知数据过期或异常");
         return false;
       }
       else if(PS == dddmr_sys_core::PlannerState::CONFIGURATION_ERROR){
         RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Configuration error, check your yaml and logs.");
-        publishZeroVelocity();
+        publishZeroVelocity("局部规划器配置错误");
         return false;
       }
       else if(PS == dddmr_sys_core::PlannerState::TF_FAIL){
         RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Detect TF fail in local planner, we're not going to allow commanding of the base for safety");
-        publishZeroVelocity();
+        publishZeroVelocity("局部规划器缺少有效里程计或 TF");
         return false;
       }
       else if(PS == dddmr_sys_core::PlannerState::PRUNE_PLAN_FAIL){
         //@ this assignment will allow at least one time planning query
         STATE_->last_valid_plan_ = clock_->now();
-        publishZeroVelocity();
+        publishZeroVelocity("路径裁剪失败，等待重新规划");
         STATE_->setDecision("d_planning");  
         return false;
       }
@@ -881,7 +889,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 
       else if(PS == dddmr_sys_core::PlannerState::PATH_BLOCKED_REPLANNING){
         STATE_->last_valid_plan_ = clock_->now();
-        publishZeroVelocity();
+        publishZeroVelocity("局部路径阻塞，等待重新规划");
         STATE_->setDecision("d_planning"); 
         RCLCPP_WARN(this->get_logger(), "Path conflits, but no need to wait.");
        	return false;
@@ -994,23 +1002,23 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 
       else if(PS == dddmr_sys_core::PlannerState::PERCEPTION_MALFUNCTION){
         RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Sensor data is out of date, we're not going to allow commanding of the base for safety");
-        publishZeroVelocity();
+        publishZeroVelocity("感知数据过期或异常");
         return false;
       }
       else if(PS == dddmr_sys_core::PlannerState::CONFIGURATION_ERROR){
         RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Configuration error, check your yaml and logs.");
-        publishZeroVelocity();
+        publishZeroVelocity("局部规划器配置错误");
         return false;
       }
       else if(PS == dddmr_sys_core::PlannerState::TF_FAIL){
         RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Detect TF fail in local planner, we're not going to allow commanding of the base for safety");
-        publishZeroVelocity();
+        publishZeroVelocity("局部规划器缺少有效里程计或 TF");
         return false;
       }
 
       else if(PS == dddmr_sys_core::PlannerState::PRUNE_PLAN_FAIL){
         STATE_->last_valid_plan_ = clock_->now();
-        publishZeroVelocity();
+        publishZeroVelocity("路径裁剪失败，等待重新规划");
         STATE_->setDecision("d_planning");  
         return false;
       }

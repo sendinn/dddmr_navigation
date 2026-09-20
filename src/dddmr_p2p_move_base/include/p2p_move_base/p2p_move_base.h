@@ -96,7 +96,7 @@ class P2PMoveBase : public rclcpp::Node {
 
     bool isQuaternionValid(const geometry_msgs::msg::Quaternion& q);
 
-    void publishZeroVelocity();
+    void publishZeroVelocity(const char* reason = "状态机要求停车", int source_line = __builtin_LINE());
     void publishVelocity(const base_trajectory::Trajectory& cmd_traj);
 
     std::shared_ptr<p2p_move_base::State> STATE_;
