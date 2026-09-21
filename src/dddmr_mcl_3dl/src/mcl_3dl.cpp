@@ -59,6 +59,10 @@ bool MCL3dlNode::configure(const std::shared_ptr<mcl_3dl::SubMaps>& sub_maps)
 {
   sub_maps_ = sub_maps;
   params_ = std::make_shared<Parameters>(this->get_node_logging_interface(), this->get_node_parameters_interface());
+  relocalization_only_ = declare_parameter<bool>("relocalization_only", false);
+  odom_only_ = relocalization_only_;  // No matching until an explicit initial pose.
+  declare_parameter<double>("localization_xy_std_max", 0.15);
+  declare_parameter<double>("localization_yaw_std_max", 0.20);
   planar_mode_ = this->declare_parameter<bool>("planar_mode", false);
   stationary_update_interval_ = this->declare_parameter<double>("stationary_update_interval", 0.0);
   if (!std::isfinite(stationary_update_interval_) || stationary_update_interval_ < 0.0)
@@ -130,7 +134,8 @@ bool MCL3dlNode::configure(const std::shared_ptr<mcl_3dl::SubMaps>& sub_maps)
 
   pub_ground_normal_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("ground_normal", 1);  
   pub_pc_ec_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("euclidean_cluster_extraction", 1);
-  pub_pose_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("mcl_pose", 1);
+  pub_pose_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "mcl_pose", rclcpp::QoS(1).reliable().transient_local());
   pub_particle_ = this->create_publisher<geometry_msgs::msg::PoseArray>("particles", 1);
   
   has_odom_ = false;
@@ -141,11 +146,17 @@ bool MCL3dlNode::configure(const std::shared_ptr<mcl_3dl::SubMaps>& sub_maps)
 
   odom_only_pub_ = create_publisher<std_msgs::msg::Bool>(
     "mcl/odom_only", rclcpp::QoS(1).reliable().transient_local());
-  odom_only_pub_->publish(std_msgs::msg::Bool());
+  std_msgs::msg::Bool initial_mode; initial_mode.data = odom_only_;
+  odom_only_pub_->publish(initial_mode);
   odom_only_service_ = create_service<std_srvs::srv::SetBool>("mcl/set_odom_only",
     [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
            std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
       std::lock_guard<std::mutex> guard(protect_measure_in_odomcb_);
+      if (relocalization_only_ && (!request->data || !odom_only_)) {
+        response->success = false;
+        response->message = "MCL is only enabled by initialpose; wait for relocalization completion";
+        return;
+      }
       if (request->data && (!tf_ready_ || !has_odom_ || !params_->publish_tf_)) {
         response->success = false;
         response->message = "A valid map-to-odom transform is required";
@@ -221,6 +232,7 @@ void MCL3dlNode::cbOdom(const nav_msgs::msg::Odometry::SharedPtr msg){
     return;
   }
   if (odom_only_) {
+    if (relocalization_only_) return;  // Frozen anchor + raw odometry, no particle updates.
     // Maintain the particle prior for resuming later, but never measure,
     // resample, publish an MCL pose, or change map-to-odom during this task.
     motion_prediction_model_->setOdoms(odom_prev_, odom_);
@@ -591,6 +603,7 @@ void MCL3dlNode::measure(std::map<std::string, pcl::PointCloud<mcl_3dl::pcl_t>::
   // from a tightly clustered but incorrect initial distribution.
   if (match_ratio_max < params_->match_ratio_thresh_)
   {
+    relocalization_gate_.reset();
     RCLCPP_WARN_THROTTLE(
         this->get_logger(), *clock_, 3000,
         "Localization measurement rejected: best match ratio %.3f is below %.3f",
@@ -723,6 +736,19 @@ void MCL3dlNode::measure(std::map<std::string, pcl::PointCloud<mcl_3dl::pcl_t>::
     pose.pose.covariance[i] = cov[i / 6][i % 6];
   }
   pub_pose_->publish(pose);
+  if (relocalization_only_) {
+    const double xy = get_parameter("localization_xy_std_max").as_double();
+    const double yaw = get_parameter("localization_yaw_std_max").as_double();
+    const auto& c = pose.pose.covariance;
+    const double age = (clock_->now() - rclcpp::Time(pose.header.stamp)).seconds();
+    if (relocalization_gate_.observe(rclcpp::Time(pose.header.stamp).nanoseconds(),
+                                    age, c[0], c[7], c[35], xy, yaw)) {
+      odom_only_ = true;
+      std_msgs::msg::Bool state; state.data = true;
+      odom_only_pub_->publish(state);
+      RCLCPP_INFO(get_logger(), "Relocalization complete: map-to-odom frozen until the next initialpose; odometry only.");
+    }
+  }
   
   //--------------------------update pose to submap
   std::unique_lock<mcl_3dl::SubMaps::sub_maps_mutex_t> lock(*(sub_maps_->getMutex()));
@@ -836,10 +862,14 @@ void MCL3dlNode::cbPosition(const geometry_msgs::msg::PoseWithCovarianceStamped:
   }
 
   std::unique_lock<std::mutex> lock(protect_measure_in_odomcb_);
-  if (odom_only_) {
+  if (odom_only_ && !relocalization_only_) {
     RCLCPP_WARN(get_logger(), "Initial pose ignored during odometry-only navigation");
     return;
   }
+  odom_only_ = false;
+  relocalization_gate_.reset();
+  std_msgs::msg::Bool mode; mode.data = false;
+  odom_only_pub_->publish(mode);
   measurement_odom_initialized_ = false;
   pcl_segmentations_.clear();
   last_measurement_scan_ns_ = rclcpp::Time(odom_header_.stamp).nanoseconds();

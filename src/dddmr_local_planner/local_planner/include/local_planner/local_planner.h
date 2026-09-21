@@ -71,6 +71,7 @@ class Local_Planner : public rclcpp::Node {
 
       void setPlan(const std::vector<geometry_msgs::msg::PoseStamped>& orig_global_plan);
       dddmr_sys_core::PlannerState computeVelocityCommand(std::string traj_gen_name, base_trajectory::Trajectory& best_traj);
+      dddmr_sys_core::PlannerState checkPathBeforeAlignment();
       void getBestTrajectory(std::string traj_gen_name, base_trajectory::Trajectory& best_traj);
 
       //@ shared data for trajectory generator, we manage the variables by this way for future changed to ROS2
@@ -89,6 +90,8 @@ class Local_Planner : public rclcpp::Node {
       void syncRobotState(nav_msgs::msg::Odometry& odom, ackermann_msgs::msg::AckermannDriveStamped& ackermann_drive_state);
       
     private:
+      double obstacle_replan_lookahead_ = 0.0;
+      bool forwardPathBlocked();
       bool path_heading_locked_ = false;
       double path_heading_ = 0.0;
       

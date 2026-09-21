@@ -1,3 +1,4 @@
+#include <trajectory_generators/braking_rollout.h>
 #include <dddmr_sys_core/motion_timestamp.h>
 /*
 * BSD 3-Clause License
@@ -54,12 +55,16 @@ void OmniSimpleTrajectoryGeneratorTheory::onInitialize(){
   axis_lateral_exit_ = node_->declare_parameter<double>(name_ + ".axis_lateral_exit", 0.05);
   if (!std::isfinite(axis_yaw_enter_) || !std::isfinite(axis_yaw_exit_) ||
       !std::isfinite(axis_lateral_enter_) || !std::isfinite(axis_lateral_exit_) ||
-      axis_yaw_exit_ <= 0 || axis_yaw_enter_ <= axis_yaw_exit_ || axis_yaw_enter_ >= 1.5707963268 ||
+      axis_yaw_exit_ <= 0 || axis_yaw_enter_ < axis_yaw_exit_ || axis_yaw_enter_ >= 1.5707963268 ||
       axis_lateral_exit_ <= 0 || axis_lateral_enter_ <= axis_lateral_exit_)
     throw std::invalid_argument("Invalid single-axis tracking thresholds");
   sample_braking_commands_ = node_->declare_parameter<bool>(name_ + ".sample_braking_commands", false);
   RCLCPP_INFO(node_->get_logger().get_child(name_), "sample_braking_commands: %s",
       sample_braking_commands_ ? "true" : "false");
+
+  braking_reaction_time_ = node_->declare_parameter<double>(name_ + ".braking_reaction_time", 0.0);
+  if (!std::isfinite(braking_reaction_time_) || braking_reaction_time_ < 0 || braking_reaction_time_ > 2)
+    throw std::invalid_argument("braking_reaction_time must be in [0,2] seconds");
 
   //@initialize trajectory generator
   limits_ = std::make_shared<trajectory_generators::OmniTrajectoryGeneratorLimits>();
@@ -418,6 +423,9 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
           "停车原因：当前轴/方向没有满足速度限制的采样; axis=%d, sign=%d", axis, axis_policy_.sign());
         sample_params_.push_back(Eigen::Vector3f::Zero());
       }
+      if (sample_braking_commands_ && axis >= 0 &&
+          !sample_params_.front().isZero(0.0f))
+        sample_params_.push_back(Eigen::Vector3f::Zero());
       // Every sample is simulated and collision-scored with this exact command.
       return;
     }
@@ -539,8 +547,18 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
   num_steps = std::max(2, num_steps);
   num_steps = std::max(num_steps, static_cast<int>(std::ceil(params_->sim_time * params_->controller_frequency)));
 
-  //compute a timestep
-  double dt = params_->sim_time / num_steps;
+  const double dt = params_->sim_time / num_steps;
+  const int command_steps = num_steps;
+  int reaction_steps = 0;
+  if (sample_braking_commands_) {
+    reaction_steps = static_cast<int>(std::ceil(braking_reaction_time_ / dt));
+    double stopping_time = 0;
+    for (int axis=0; axis<3; ++axis)
+      stopping_time = std::max(stopping_time,
+        static_cast<double>(std::max(std::abs(initial_velocity[axis]), std::abs(sample_target_vel[axis])) /
+        (acceleration[axis] * limits_->deceleration_ratio)));
+    num_steps += reaction_steps + static_cast<int>(std::ceil(stopping_time / dt));
+  }
   traj.time_delta_ = dt;
 
   //compute a timestep
@@ -560,33 +578,24 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
   /*We first create trajectory based on robot_frame, then we use affine to transform it to global frame*/
   Eigen::Vector3f pos = Eigen::Vector3f::Zero();
   //simulate the trajectory and check for collisions, updating costs along the way
-  for (int i = 0; i < num_steps; ++i) {
-
-    //update the position of the robot using the velocities passed in
-    Eigen::Vector3f average_velocity;
-    for (int axis = 0; axis < 3; ++axis) {
-      double velocity = loop_vel[axis];
-      const double target = sample_target_vel[axis];
-      double remaining = dt;
-      double displacement = 0.0;
-      // Reverse direction by braking to zero first, then accelerating.
-      for (int phase = 0; phase < 2 && remaining > 0.0; ++phase) {
-        const double phase_target = velocity * target < 0.0 ? 0.0 : target;
-        const double rate = acceleration[axis] *
-            (std::abs(phase_target) < std::abs(velocity) ? limits_->deceleration_ratio : 1.0);
-        const double delta = phase_target - velocity;
-        const double duration = std::min(remaining, std::abs(delta) / rate);
-        const double next = velocity + std::copysign(rate * duration, delta);
-        displacement += 0.5 * (velocity + next) * duration;
-        velocity = duration >= std::abs(delta) / rate ? phase_target : next;
-        remaining -= duration;
-        if (velocity == target) break;
+  // Include the current pose, reaction delay, command horizon and full stop tail.
+  for (int i = 0; i <= num_steps; ++i) {
+    if (i > 0) {
+      Eigen::Vector3f average_velocity;
+      const int step = i-1;
+      for (int axis=0; axis<3; ++axis) {
+        double velocity=loop_vel[axis];
+        if (step < reaction_steps) {
+          average_velocity[axis]=velocity;
+        } else {
+          const double target = step < reaction_steps+command_steps ? sample_target_vel[axis] : 0.0;
+          average_velocity[axis]=integrateVelocity(velocity, target, acceleration[axis],
+                                                  limits_->deceleration_ratio, dt)/dt;
+          loop_vel[axis]=velocity;
+        }
       }
-      displacement += velocity * remaining;
-      average_velocity[axis] = displacement / dt;
-      loop_vel[axis] = velocity;
+      pos = computeNewPositions(pos, average_velocity, dt);
     }
-    pos = computeNewPositions(pos, average_velocity, dt);
 
     /*transform back to global frame*/
     Eigen::Affine3d trans_gbl2traj_af3;
@@ -645,7 +654,15 @@ Eigen::Vector3f OmniSimpleTrajectoryGeneratorTheory::computeNewPositions(const E
 void OmniSimpleTrajectoryGeneratorTheory::expertScoring(std::vector<base_trajectory::Trajectory>& accepted_trajectories,
                                             std::map<std::string, std::vector<base_trajectory::Trajectory>>& rejected_trajectories, 
                                               base_trajectory::Trajectory& best_traj){
-  //use default scoring
-  TrajectoryGeneratorTheory::expertScoring(accepted_trajectories, rejected_trajectories, best_traj); 
+  if (!sample_braking_commands_ || !single_axis_tracking_) {
+    TrajectoryGeneratorTheory::expertScoring(accepted_trajectories, rejected_trajectories, best_traj);
+    return;
+  }
+  std::vector<std::array<double,4>> candidates;
+  for (const auto& t : accepted_trajectories)
+    candidates.push_back({t.xv_,t.yv_,t.thetav_,t.cost_});
+  const int best=chooseMotionOrBrake(candidates);
+  best_traj.cost_=-1;
+  if (best>=0) best_traj=accepted_trajectories[best];
 }
 }//end of name space

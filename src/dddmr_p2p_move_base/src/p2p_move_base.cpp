@@ -54,6 +54,7 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
       !std::isfinite(rotation_max_duration_) || rotation_max_duration_ <= 0)
     throw std::invalid_argument("Invalid rotation calibration");
   declare_parameter<bool>("use_mcl_during_navigation", true);
+  declare_parameter<bool>("relocalization_only", false);
   odom_only_client_ = create_client<std_srvs::srv::SetBool>("mcl/set_odom_only");
   localization_timeout_ = declare_parameter<double>("localization_timeout", 0.0);
   localization_resume_stable_time_ = declare_parameter<double>("localization_resume_stable_time", 1.0);
@@ -364,9 +365,10 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
     return;
   }
 
-  task_use_mcl_ = get_parameter("use_mcl_during_navigation").as_bool();
+  const bool persistent_odom = get_parameter("relocalization_only").as_bool();
+  task_use_mcl_ = !persistent_odom && get_parameter("use_mcl_during_navigation").as_bool();
   // Restore scan matching on all exits: success, cancellation, rejection, or failure.
-  auto restore_mcl = std::shared_ptr<void>(nullptr, [this, odom_only = !task_use_mcl_](void*) {
+  auto restore_mcl = std::shared_ptr<void>(nullptr, [this, odom_only = !task_use_mcl_ && !persistent_odom](void*) {
     if (odom_only) {
       publishZeroVelocity();
       if (!setOdomOnly(false))
@@ -376,13 +378,13 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
   if (!task_use_mcl_) {
     const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (localization_timeout_ <= 0 || now >= localization_valid_until_.load() || !setOdomOnly(true)) {
+    if ((!persistent_odom && (localization_timeout_ <= 0 || now >= localization_valid_until_.load())) || !setOdomOnly(true)) {
       publishZeroVelocity();
       RCLCPP_ERROR(get_logger(), "Navigation mode rejected: valid initial localization and MCL mode service required.");
       goal_handle->abort(result);
       return;
     }
-    RCLCPP_INFO(get_logger(), "Odometry-only navigation: map-to-odom frozen for this task.");
+    RCLCPP_INFO(get_logger(), "Odometry-only navigation: map-to-odom frozen; MCL policy controls when matching resumes.");
   }
   rclcpp::Rate r(STATE_->controller_frequency_);
 
@@ -395,6 +397,7 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
   LP_->resetRotationReference();
   localization_paused_ = false;
   localization_replanning_ = false;
+  obstacle_replan_.clear();
   STATE_->current_goal_ = move_base_goal->target_pose;
   GPM_->setGoal(STATE_->current_goal_);
   GPM_->resume();
@@ -452,6 +455,15 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
 }
 
 bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHandle<dddmr_sys_core::action::PToPMoveBase>> goal_handle){
+    const double obstacle_now = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (obstacle_replan_.expired(obstacle_now, STATE_->controller_patience_)) {
+      publishZeroVelocity("障碍阻塞持续超时，停止任务");
+      RCLCPP_ERROR(get_logger(), "Obstacle replanning timeout: no executable path; navigation aborted.");
+      goal_handle->abort(std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>());
+      return true;
+    }
+
     const auto steady_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     bool localization_invalid = false;
@@ -576,7 +588,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
           return true;
         }
         //if the planner fails or returns a zero length plan, planning failed
-        if(plan.empty()){
+        if(plan.size()<3){
           RCLCPP_DEBUG(this->get_logger(), "Failed to find a plan to point (%.2f, %.2f, %.2f)", 
               STATE_->current_goal_.pose.position.x, STATE_->current_goal_.pose.position.y, STATE_->current_goal_.pose.position.z);
           STATE_->setDecision("d_planning");
@@ -591,7 +603,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
             localization_replanning_ = false;
             RCLCPP_INFO(get_logger(), "Localization resume plan ready: continuing retained goal.");
           }
-          STATE_->setDecision("d_align_heading");  
+          STATE_->setDecision("d_validate_path");
         }
       }
 
@@ -605,7 +617,39 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       return false;
     }
     
+    else if(STATE_->isCurrentDecision("d_validate_path")) {
+      publishZeroVelocity("新路径等待通行检查，保持停车");
+      const auto status=LP_->checkPathBeforeAlignment();
+      const bool clear=status==dddmr_sys_core::TRAJECTORY_FOUND;
+      const bool checked=clear || status==dddmr_sys_core::PATH_BLOCKED_REPLANNING ||
+                         status==dddmr_sys_core::PRUNE_PLAN_FAIL;
+      const auto admission=obstacle_replan_.admit(obstacle_now,checked,clear);
+      if (admission==ObstacleReplan::Admission::Align) {
+        LP_->resetRotationReference();
+        STATE_->setDecision("d_align_heading");
+        RCLCPP_INFO(get_logger(), "新路径通行检查通过，允许进入朝向对齐");
+      } else if (admission==ObstacleReplan::Admission::Replan) {
+        GPM_->resume();
+        STATE_->last_valid_plan_=clock_->now();
+        STATE_->setDecision("d_planning");
+        RCLCPP_WARN(get_logger(), "新路径仍阻塞或无效：保持停车重新规划，不进入旋转");
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(),*clock_,1000,
+          "新路径尚未通过检查：保持停车，等待感知/TF 或重规划间隔; status=%d",
+          static_cast<int>(status));
+      }
+      return false;
+    }
+
     else if(STATE_->isCurrentDecision("d_align_heading")){
+      // Recheck while aligning too: a newly observed obstruction must not
+      // permit repeated turns simply because an earlier snapshot was clear.
+      if (LP_->checkPathBeforeAlignment()!=dddmr_sys_core::TRAJECTORY_FOUND) {
+        publishZeroVelocity("对齐期间路径不再可通行，停车重新检查");
+        STATE_->setDecision("d_validate_path");
+        return false;
+      }
+
 
       if(LP_->isInitialHeadingAligned()){
         if (stop_after_heading_alignment_) {
@@ -843,6 +887,21 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 
       base_trajectory::Trajectory best_traj;
       dddmr_sys_core::PlannerState PS = LP_->computeVelocityCommand(STATE_->main_trajectory_generator_, best_traj);
+      if (PS == dddmr_sys_core::PATH_BLOCKED_REPLANNING || PS == dddmr_sys_core::PATH_BLOCKED_WAIT) {
+        publishZeroVelocity("提前检测到障碍，制动并重规划");
+        if (obstacle_replan_.blocked(obstacle_now)) {
+          // Invalidate cached/in-flight results before requesting the retained goal.
+          GPM_->resume();
+          STATE_->last_valid_plan_ = clock_->now();
+          STATE_->setDecision("d_planning");
+          RCLCPP_WARN(get_logger(), "Obstacle replanning requested: cached plan discarded; waiting for a fresh result.");
+        }
+        return false;
+      }
+      if (PS == dddmr_sys_core::TRAJECTORY_FOUND &&
+          std::hypot(best_traj.xv_,best_traj.yv_)>1e-6)
+        obstacle_replan_.clear();
+
 
       if(PS == dddmr_sys_core::PlannerState::TRAJECTORY_FOUND){
         STATE_->last_valid_control_ = clock_->now();
@@ -888,20 +947,6 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         return false;
       }
 
-      else if(PS == dddmr_sys_core::PlannerState::PATH_BLOCKED_REPLANNING){
-        STATE_->last_valid_plan_ = clock_->now();
-        publishZeroVelocity("局部路径阻塞，等待重新规划");
-        STATE_->setDecision("d_planning"); 
-        RCLCPP_WARN(this->get_logger(), "Path conflits, but no need to wait.");
-       	return false;
-      }
-
-      else if(PS == dddmr_sys_core::PlannerState::PATH_BLOCKED_WAIT){
-        STATE_->waiting_time_ = clock_->now();
-        STATE_->setDecision("d_waiting");
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 5000, "Path conflits, switch to waiting state.");
-       	return false;
-      }
 
       else{
         RCLCPP_FATAL(this->get_logger(), "Should not happen here, we did not catch dddmr_sys_core::PlannerState");

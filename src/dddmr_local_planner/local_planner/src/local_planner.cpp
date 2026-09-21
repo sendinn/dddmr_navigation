@@ -1,3 +1,6 @@
+#include <dddmr_sys_core/motion_timestamp.h>
+#include <trajectory_generators/path_sweep.h>
+#include <trajectory_generators/braking_rollout.h>
 /*
 * BSD 3-Clause License
 
@@ -109,6 +112,9 @@ void Local_Planner::initial(
   robot_frame_ = perception_3d_ros_->getGlobalUtils()->getRobotFrame();
   global_frame_ = perception_3d_ros_->getGlobalUtils()->getGblFrame();
   parseCuboid(); //after robot_frame is got
+  obstacle_replan_lookahead_ = declare_parameter<double>("obstacle_replan_lookahead", 0.0);
+  if (!std::isfinite(obstacle_replan_lookahead_) || obstacle_replan_lookahead_<0 || obstacle_replan_lookahead_>5)
+    throw std::invalid_argument("obstacle_replan_lookahead must be in [0,5] meters");
   
   pub_robot_cuboid_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("robot_cuboid", 1);  
   pub_aggregate_observation_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("aggregated_pc", 1);  
@@ -428,6 +434,47 @@ void Local_Planner::prunePlan(double forward_distance, double backward_distance)
   //RCLCPP_DEBUG(this->get_logger().get_child(name_), "%lu",prune_plan_.poses.size());
 }
 
+bool Local_Planner::forwardPathBlocked() {
+  if (obstacle_replan_lookahead_<=0 || marker_edge_.points.size()<8) return false;
+  std::vector<std::array<double,3>> path;
+  for (const auto& p : global_plan_)
+    path.push_back({p.pose.position.x,p.pose.position.y,p.pose.position.z});
+  const auto& t=trans_gbl2b_.transform;
+  auto samples=trajectory_generators::forwardPathSamples(path,t.translation.x,t.translation.y,
+                                                        t.translation.z,obstacle_replan_lookahead_,.05,heading_tracking_distance_);
+  tf2::Quaternion current(t.rotation.x,t.rotation.y,t.rotation.z,t.rotation.w);
+  double roll,pitch,yaw;
+  tf2::Matrix3x3(current).getRPY(roll,pitch,yaw);
+  std::array<double,3> lo{1e9,1e9,1e9},hi{-1e9,-1e9,-1e9};
+  double radius=0;
+  for(size_t i=0;i<8;++i) {
+    const auto& p=marker_edge_.points[i];
+    const std::array<double,3> v{p.x,p.y,p.z};
+    for(int a=0;a<3;++a) {lo[a]=std::min(lo[a],v[a]);hi[a]=std::max(hi[a],v[a]);}
+    radius=std::max(radius,std::sqrt(p.x*p.x+p.y*p.y+p.z*p.z));
+  }
+  auto data=mpc_critics_ros_->getSharedDataPtr();
+  for(const auto& sample:samples) {
+    tf2::Quaternion q; q.setRPY(roll,pitch,sample[3]);
+    tf2::Transform frame(q,tf2::Vector3(sample[0],sample[1],sample[2]));
+    const auto inverse=frame.inverse();
+    pcl::PointXYZI center;center.x=sample[0];center.y=sample[1];center.z=sample[2];
+    std::vector<int> indices;std::vector<float> distances;
+    data->pcl_perception_kdtree_->radiusSearch(center,radius,indices,distances);
+    for(int index:indices) {
+      const auto& p=data->pcl_perception_->points[index];
+      const auto local=inverse*tf2::Vector3(p.x,p.y,p.z);
+      if(trajectory_generators::pointInBox({local.x(),local.y(),local.z()},lo,hi)) {
+        RCLCPP_WARN_THROTTLE(get_logger(),*clock_,1000,
+          "提前避障：前方路径车身包络被占据，停车重规划; lookahead=%.2f m, path_pose=(%.3f,%.3f), path_yaw=%.3f rad, robot_yaw=%.3f rad, obstacle=(%.3f,%.3f,%.3f)",
+          obstacle_replan_lookahead_,sample[0],sample[1],sample[3],yaw,p.x,p.y,p.z);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 void Local_Planner::getBestTrajectory(std::string traj_gen_name, base_trajectory::Trajectory& best_traj){
 
   geometry_msgs::msg::PoseArray accepted_pose_arr;
@@ -558,6 +605,38 @@ void Local_Planner::getBestTrajectory(std::string traj_gen_name, base_trajectory
 
 }
 
+// Read-only motion admission: no trajectory generator, axis state, or commands.
+dddmr_sys_core::PlannerState Local_Planner::checkPathBeforeAlignment() {
+  if (!got_odom_) return dddmr_sys_core::TF_FAIL;
+  const auto now=clock_->now();
+  const auto odom_stamp=rclcpp::Time(robot_state_.header.stamp);
+  const auto pose_stamp=rclcpp::Time(trans_gbl2b_.header.stamp);
+  if (!dddmr_sys_core::motionTimestampFresh(odom_stamp.nanoseconds(),(now-odom_stamp).seconds()) ||
+      !dddmr_sys_core::motionTimestampFresh(pose_stamp.nanoseconds(),(now-pose_stamp).seconds()))
+    return dddmr_sys_core::TF_FAIL;
+  auto perception=perception_3d_ros_->getStackedPerception();
+  std::unique_lock<perception_3d::StackedPerception::mutex_t> pct_lock(*perception->getMutex());
+  if (!perception->isSensorOK()) return dddmr_sys_core::PERCEPTION_MALFUNCTION;
+  if (global_plan_.size()<3) return dddmr_sys_core::PRUNE_PLAN_FAIL;
+  for (const auto& p:global_plan_)
+    if (!std::isfinite(p.pose.position.x) || !std::isfinite(p.pose.position.y) ||
+        !std::isfinite(p.pose.position.z)) return dddmr_sys_core::PRUNE_PLAN_FAIL;
+  perception->aggregateObservations();
+  auto observations=perception_3d_ros_->getSharedDataPtr()->aggregate_observation_;
+  if (observations->size()<5) return dddmr_sys_core::PERCEPTION_MALFUNCTION;
+  std::unique_lock<mpc_critics::StackedScoringModel::model_mutex_t> critics_lock(
+    *mpc_critics_ros_->getStackedScoringModelPtr()->getMutex());
+  auto data=mpc_critics_ros_->getSharedDataPtr();
+  data->robot_pose_=trans_gbl2b_;
+  data->robot_state_=robot_state_;
+  data->pcl_perception_=observations;
+  // updateSharedData also builds the obstacle KD-tree used by the path sweep.
+  data->prune_plan_=prune_plan_;
+  mpc_critics_ros_->updateSharedData();
+  return forwardPathBlocked() ? dddmr_sys_core::PATH_BLOCKED_REPLANNING :
+                               dddmr_sys_core::TRAJECTORY_FOUND;
+}
+
 dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string traj_gen_name, base_trajectory::Trajectory& best_traj){
   
   if(!got_odom_){
@@ -676,6 +755,21 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   //@ Below function generate kd-tree using aggregate observation
   mpc_critics_ros_->updateSharedData();
   getBestTrajectory(traj_gen_name, best_traj);
+  if (traj_gen_name == "omni_drive_simple" && obstacle_replan_lookahead_>0) {
+    bool collision_rejected_motion=false;
+    for (const auto& entry : rejected_trajectories_) {
+      if (entry.first.find("collision")==std::string::npos) continue;
+      for (const auto& t : entry.second)
+        collision_rejected_motion |= !trajectory_generators::zeroCommand(t.xv_,t.yv_,t.thetav_);
+    }
+    const bool brake_only=best_traj.cost_<0 ||
+      trajectory_generators::zeroCommand(best_traj.xv_,best_traj.yv_,best_traj.thetav_);
+    if (forwardPathBlocked() || (collision_rejected_motion && brake_only)) {
+      RCLCPP_WARN_THROTTLE(get_logger(),*clock_,1000,
+        "停车原因：前方路径阻塞或仅剩刹车候选，立即请求新路径");
+      return dddmr_sys_core::PATH_BLOCKED_REPLANNING;
+    }
+  }
 
   auto t_diff = clock_->now() - control_loop_time_;
   RCLCPP_DEBUG(this->get_logger().get_child(name_), "Full control cycle time: %.9f", t_diff.seconds());

@@ -73,6 +73,7 @@ class OmniSimpleTrajectoryGeneratorTheory: public TrajectoryGeneratorTheory{
 
     unsigned int next_sample_index_;
     bool sample_braking_commands_ = false;
+    double braking_reaction_time_ = 0.0;
     bool single_axis_tracking_ = false;
     double axis_yaw_enter_, axis_yaw_exit_, axis_lateral_enter_, axis_lateral_exit_;
     SingleAxisTracking axis_policy_;

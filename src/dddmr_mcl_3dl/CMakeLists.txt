@@ -188,6 +188,9 @@ endif()
 # --- Everything CI/CD test finish here ---
 
 if(BUILD_TESTING)
+  add_executable(relocalization_gate_test test/relocalization_gate_test.cpp)
+  target_compile_options(relocalization_gate_test PRIVATE -UNDEBUG)
+  add_test(NAME relocalization_gate_test COMMAND relocalization_gate_test)
   enable_testing()
   add_executable(planar_constraint_test test/planar_constraint_test.cpp)
   target_compile_options(planar_constraint_test PRIVATE -UNDEBUG)

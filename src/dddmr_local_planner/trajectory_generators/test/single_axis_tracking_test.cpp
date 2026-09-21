@@ -138,4 +138,17 @@ int main() {
   assert(sample(0)==0);
   tick -= 10;
   assert(sample(0,.255)==-1);
+  // Equal enter/exit thresholds: >10 degrees turns; <=10 degrees brakes
+  // the turn and confirms stopped samples before resuming X.
+  SingleAxisTracking ten_degree;
+  const double ten = pi/18;
+  TrackingErrors heading_boundary{true,ten+.001,0,1};
+  for (int i=1;i<=3;++i)
+    assert(ten_degree.choose(heading_boundary,{0,0,0},i,true,ten,ten,.3,.15)==(i<3?-1:2));
+  heading_boundary.heading=ten;
+  assert(ten_degree.choose(heading_boundary,{0,0,.12},4,true,ten,ten,.3,.15)==-1);
+  for (int i=5;i<=7;++i)
+    assert(ten_degree.choose(heading_boundary,{0,0,0},i,true,ten,ten,.3,.15)==(i<7?-1:0));
+  heading_boundary.heading=-ten-.001;
+  assert(ten_degree.choose(heading_boundary,{.1,0,0},8,true,ten,ten,.3,.15)==-1);
 }

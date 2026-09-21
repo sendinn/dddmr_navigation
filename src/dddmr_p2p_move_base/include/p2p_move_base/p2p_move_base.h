@@ -1,3 +1,4 @@
+#include <p2p_move_base/obstacle_replan.h>
 /*
 * BSD 3-Clause License
 
@@ -137,6 +138,7 @@ class P2PMoveBase : public rclcpp::Node {
     LocalizationRecovery localization_recovery_;
     bool localization_paused_ = false;
     bool localization_replanning_ = false;
+    ObstacleReplan obstacle_replan_;
     std::atomic<int64_t> localization_valid_until_{0};
     std::mutex localization_diagnostics_mutex_;
     int64_t localization_stamp_ns_ = 0;

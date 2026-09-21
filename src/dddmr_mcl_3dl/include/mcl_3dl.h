@@ -1,3 +1,4 @@
+#include <mcl_3dl/relocalization_gate.h>
 /*
  * Copyright (c) 2016-2017, the mcl_3dl authors
  * All rights reserved.
@@ -145,6 +146,8 @@ class MCL3dlNode : public rclcpp::Node
 
   private:
     bool odom_only_ = false;
+    bool relocalization_only_ = false;
+    RelocalizationGate relocalization_gate_;
     rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr odom_only_service_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr odom_only_pub_;
     // Caller holds protect_measure_in_odomcb_; both input callbacks may update.
