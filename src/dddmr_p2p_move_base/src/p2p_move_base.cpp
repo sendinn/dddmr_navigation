@@ -526,6 +526,17 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       goal_handle->abort(result);
       return true;
     }
+    if (GPM_->consumeNoPathEvent()) {
+      publishZeroVelocity("当前障碍快照暂无全局路径，保持停车并重试");
+      // Start a bounded retry episode. Further empty results do not reset this
+      // deadline; planner_patience still decides when recovery is necessary.
+      STATE_->last_valid_plan_ = clock_->now();
+      STATE_->setDecision("d_planning");
+      RCLCPP_WARN(get_logger(),
+        "Global planner returned no path for the current obstacle snapshot; "
+        "stopped and retrying for up to %.1f s.", STATE_->planner_patience_);
+      return false;
+    }
 
     STATE_->global_pose_ = LP_->getGlobalPose();
     LP_->syncRobotState(robot_state_, ackermann_drive_state_);
@@ -629,7 +640,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         STATE_->setDecision("d_align_heading");
         RCLCPP_INFO(get_logger(), "新路径通行检查通过，允许进入朝向对齐");
       } else if (admission==ObstacleReplan::Admission::Replan) {
-        GPM_->resume();
+        GPM_->resume(true);
         STATE_->last_valid_plan_=clock_->now();
         STATE_->setDecision("d_planning");
         RCLCPP_WARN(get_logger(), "新路径仍阻塞或无效：保持停车重新规划，不进入旋转");
@@ -891,7 +902,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         publishZeroVelocity("提前检测到障碍，制动并重规划");
         if (obstacle_replan_.blocked(obstacle_now)) {
           // Invalidate cached/in-flight results before requesting the retained goal.
-          GPM_->resume();
+          GPM_->resume(true);
           STATE_->last_valid_plan_ = clock_->now();
           STATE_->setDecision("d_planning");
           RCLCPP_WARN(get_logger(), "Obstacle replanning requested: cached plan discarded; waiting for a fresh result.");

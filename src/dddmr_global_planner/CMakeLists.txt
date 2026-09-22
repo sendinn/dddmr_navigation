@@ -167,6 +167,19 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(cuboid_footprint_test
+    test/cuboid_footprint_test.cpp
+  )
+  target_link_libraries(cuboid_footprint_test
+    ${PCL_LIBRARIES}
+  )
+  ament_target_dependencies(cuboid_footprint_test
+    ${dependencies}
+  )
+endif()
+
 ament_export_include_directories(include)
 ament_export_libraries(a_star_on_graph global_planner dynamic_window_aware_global_planner)
 ament_export_dependencies(${dependencies})

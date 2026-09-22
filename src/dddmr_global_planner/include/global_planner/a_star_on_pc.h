@@ -47,6 +47,7 @@ type graph_t is defined here
 /*For perception*/
 #include <perception_3d/perception_3d_ros.h>
 #include <global_planner/nanoflann_pcl.hpp>
+#include <global_planner/cuboid_footprint.h>
 
 typedef struct {
   unsigned int self_index;
@@ -91,9 +92,12 @@ class AstarList{
 class A_Star_on_Graph{
 
     public:
-      A_Star_on_Graph(pcl::PointCloud<pcl::PointXYZI>::Ptr pc_original_z_up, 
+      A_Star_on_Graph(
+        pcl::PointCloud<pcl::PointXYZI>::Ptr pc_original_z_up,
+        pcl::PointCloud<pcl::PointXYZI>::Ptr pc_map,
         std::shared_ptr<perception_3d::Perception3D_ROS> perception_ros,
-        double a_star_expanding_radius);
+        double a_star_expanding_radius,
+        const CuboidFootprint & footprint);
       
       ~A_Star_on_Graph();
       
@@ -103,12 +107,25 @@ class A_Star_on_Graph{
       
       void setupTurningWeight(double m_weight){turning_weight_ = m_weight;}
 
+      bool isFootprintSweepClear(
+        const pcl::PointXYZI & pcl_current,
+        const pcl::PointXYZI & pcl_expanding) const;
+      bool isFootprintSweepClearAtYaw(
+        const pcl::PointXYZI & pcl_current,
+        const pcl::PointXYZI & pcl_expanding, double yaw) const;
+      bool isFootprintPoseClear(const pcl::PointXYZI & center, double yaw) const;
+
     private:
       
       //@ kd-tree for line-of-sight
       nanoflann::KdTreeFLANN<pcl::PointXYZI>::Ptr kdtree_lethal_;
+      nanoflann::KdTreeFLANN<pcl::PointXYZI>::Ptr kdtree_observation_;
+      nanoflann::KdTreeFLANN<pcl::PointXYZI>::Ptr kdtree_map_;
 
       pcl::PointCloud<pcl::PointXYZI>::Ptr pc_original_z_up_;
+      pcl::PointCloud<pcl::PointXYZI>::Ptr pc_map_;
+      pcl::PointCloud<pcl::PointXYZI>::Ptr pc_lethal_;
+      pcl::PointCloud<pcl::PointXYZI>::Ptr pc_observation_;
 
       /*Provide dynamic graph for obstacle avoidance*/
       std::shared_ptr<perception_3d::Perception3D_ROS> perception_ros_;
@@ -122,9 +139,9 @@ class A_Star_on_Graph{
       //@ neighborhodd expanding radius
       double a_star_expanding_radius_;
 
+      CuboidFootprint footprint_;
+
       double getThetaFromParent2Expanding(pcl::PointXYZI m_pcl_current_parent, pcl::PointXYZI m_pcl_current, pcl::PointXYZI m_pcl_expanding);
       double getPitchFromParent2Expanding(pcl::PointXYZI m_pcl_current_parent, pcl::PointXYZI m_pcl_current, pcl::PointXYZI m_pcl_expanding);
 
-      bool isLineOfSightClear(pcl::PointXYZI& pcl_current, pcl::PointXYZI& pcl_expanding, double inscribed_radius);
 };
-

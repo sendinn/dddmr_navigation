@@ -308,16 +308,25 @@ bool Local_Planner::isGoalReached(){
     return false;
 }
 
+// 接收并保存任务管理器给出的最新全局路径，为后续局部路径裁剪建立空间索引。
+// 本函数只替换局部规划器的参考路径，不生成速度轨迹；轨迹生成和评分在
+// computeVelocityCommand() 中进行，prunePlan() 会使用这里建立的 KD-tree。
 void Local_Planner::setPlan(const std::vector<geometry_msgs::msg::PoseStamped>& orig_global_plan) {
 
+  // 局部规划至少需要三个路径点才能可靠确定前后关系和行驶方向。
+  // 路径不足时直接拒绝本次更新，保留原有 global_plan_ 和 KD-tree。
   if(orig_global_plan.size()<3){
     RCLCPP_ERROR(this->get_logger().get_child(name_), "Size of global plan is smaller than 3.");
     return;
   }
 
+  // 保存完整的 PoseStamped 路径。位姿中的位置供裁剪和距离判断使用，
+  // 朝向及末点位姿仍保留在 global_plan_ 中，供方向跟踪和终点判断使用。
   global_plan_.clear();
   global_plan_ = orig_global_plan;
 
+  // 将 ROS 路径转换为只包含 XYZ 的 PCL 点云，点的顺序和 global_plan_ 完全一致。
+  // 因此 KD-tree 返回的点索引可以直接作为 global_plan_ 的数组索引使用。
   pcl_global_plan_.reset(new pcl::PointCloud<pcl::PointXYZ>);
   for(auto gbl_it = global_plan_.begin(); gbl_it!=global_plan_.end();gbl_it++){
     pcl::PointXYZ pt;
@@ -327,8 +336,11 @@ void Local_Planner::setPlan(const std::vector<geometry_msgs::msg::PoseStamped>& 
     pcl_global_plan_->push_back(pt);
   }
 
+  // 为最新全局路径重建 KD-tree。prunePlan() 用它查找离机器人最近的路径点，
+  // 再以该点为中心截取前后一定距离的 prune_plan_，交给轨迹生成器和评分器。
   kdtree_global_plan_.reset(new pcl::KdTreeFLANN<pcl::PointXYZ>());
   kdtree_global_plan_->setInputCloud (pcl_global_plan_);
+  // 控制状态下可能重复收到同一路径，日志限流为每 10 秒最多输出一次。
   RCLCPP_INFO_THROTTLE(this->get_logger().get_child(name_), *clock_, 10000, "Recieve new global plan.");
   //RCLCPP_INFO(this->get_logger().get_child(name_), "Recieve new global plan: %.2f, %.2f", 
   //    global_plan_.back().pose.position.x, global_plan_.back().pose.position.y);
@@ -362,55 +374,77 @@ geometry_msgs::msg::TransformStamped Local_Planner::getGlobalPose(){
   return trans_gbl2b_;
 }
 
+// 以机器人在完整全局路径上的最近点为中心，截取前后指定弧长的局部参考路径。
+// forward_distance/backward_distance 是沿路径逐段累计的距离，不是以机器人为圆心的半径。
+// prune_plan_ 保留 PoseStamped 供轨迹生成和评分；pcl_prune_plan_ 额外用 intensity
+// 标记前后方向，供 perception_3d 的路径阻塞策略使用。
 void Local_Planner::prunePlan(double forward_distance, double backward_distance){
 
+  // 每次控制周期重新生成裁剪结果，避免上一周期的局部路径残留。
   prune_plan_.poses.clear();
   pcl_prune_plan_.clear();
+  // setPlan() 正常只接受至少三个点；这里再次防御空路径或尚未完成初始化的情况。
+  // 提前返回时不会刷新 last_valid_prune_plan_，持续失败最终会触发 PRUNE_PLAN_FAIL。
   if(pcl_global_plan_->points.size()<3)
     return;
 
+  // nearestKSearch() 的输出：最近点在 pcl_global_plan_ 中的索引，以及三维距离平方。
+  // setPlan() 保持 PCL 点与 global_plan_ 的顺序一致，因此该索引可直接访问 global_plan_。
   std::vector<int> pointIdxNKNSearch(1);
   std::vector<float> pointNKNSquaredDistance(1);
+  // KD-tree 查询点使用当前 map -> base_link 变换中的机器人全局 XYZ。
   pcl::PointXYZ robot_pose;
   robot_pose.x = trans_gbl2b_.transform.translation.x;
   robot_pose.y = trans_gbl2b_.transform.translation.y;
   robot_pose.z = trans_gbl2b_.transform.translation.z;
 
+  // 找不到最近路径点时无法确定裁剪中心，本轮不生成 prune_plan_。
   if ( kdtree_global_plan_->nearestKSearch (robot_pose, 1, pointIdxNKNSearch, pointNKNSquaredDistance) <= 0 ){
     RCLCPP_DEBUG(this->get_logger().get_child(name_), "Ready to fix some exception here.");
     return;
   }
 
 
+  // 机器人到最近全局路径点的三维距离超过 1 m 时认为已经严重偏离路线。
+  // 本轮保持裁剪结果为空；连续超过 prune_plane_timeout_ 后由上层停车并重新规划。
   if(sqrt(pointNKNSquaredDistance[0])>1.0){
     RCLCPP_DEBUG(this->get_logger().get_child(name_), "Deviate from plan, fix some exception here.");
     //@ consider to clear prune_plan in model_shared_data?
     return;
   }
 
-  //@ backward check
+  // ---------------- 向路径起点方向截取 ----------------
+  // 从最近点开始按索引递减，逐段扣减 backward_distance。
   geometry_msgs::msg::PoseStamped last_pose = global_plan_[pointIdxNKNSearch[0]];
   for(int i=pointIdxNKNSearch[0]; i>=0; i--){
     prune_plan_.poses.push_back(global_plan_[i]);
     pcl::PointXYZI pt;
     pt.x = global_plan_[i].pose.position.x; pt.y = global_plan_[i].pose.position.y; pt.z = global_plan_[i].pose.position.z;
-    pt.intensity = -1; //@ we tag backward plan as negative for path_blocked_strategy(plugin) to distinguish the backward pose
+    // intensity=-1 不是激光强度，而是“机器人后方路径点”的内部标签。
+    pt.intensity = -1;
     pcl_prune_plan_.points.push_back(pt);
     if(i<pointIdxNKNSearch[0]){
+      // 按相邻路径点的三维线段长度累计，而不是按索引数量截取。
       backward_distance -= getDistanceBTWPoseStamp(last_pose, global_plan_[i]);
     }
     last_pose = global_plan_[i];
+    // 当前点已经加入后才判断，因此末点可能比请求距离多覆盖一个路径线段。
     if(backward_distance<0)
       break;
   }
   
+  // 上面的插入顺序是“最近点 -> 更早的点”，与正常行驶顺序相反；
+  // 这里只反转 ROS 路径，使 prune_plan_ 恢复为“较早点 -> 最近点”的正向顺序。
   std::reverse(prune_plan_.poses.begin(),prune_plan_.poses.end()); 
 
-  //@ forward check
+  // ---------------- 向路径终点方向截取 ----------------
+  // 从最近点开始按索引递增。最近点会在前后两段的交界处再次加入，
+  // 后续评分按有序局部参考线继续处理这些 PoseStamped。
   for(int i=pointIdxNKNSearch[0];i<global_plan_.size();i++){
     prune_plan_.poses.push_back(global_plan_[i]);
     pcl::PointXYZI pt;
     pt.x = global_plan_[i].pose.position.x; pt.y = global_plan_[i].pose.position.y; pt.z = global_plan_[i].pose.position.z;
+    // PCL 路径用非负 intensity 标记前向部分：全局路径第 0 点为 0，其余前向点为 1。
     if(i == 0){
       pt.intensity = 0;
     }
@@ -420,15 +454,19 @@ void Local_Planner::prunePlan(double forward_distance, double backward_distance)
     pcl_prune_plan_.points.push_back(pt);
 
     if(i>pointIdxNKNSearch[0]){
+      // 从最近点开始累计相邻路径点的三维线段长度。
       forward_distance -= getDistanceBTWPoseStamp(last_pose, global_plan_[i]);
     }
     last_pose = global_plan_[i];
+    // 与后向截取相同，超出阈值的当前点已经保留，保证局部段覆盖请求距离。
     if(forward_distance<0)
       break;
   }
   
+  // 裁剪路径仍位于全局规划坐标系；时间戳表示本轮局部路径生成时间。
   prune_plan_.header.frame_id = perception_3d_ros_->getGlobalUtils()->getGblFrame();
   prune_plan_.header.stamp = clock_->now();
+  // 发布 /prune_plan 供调试显示，并记录本轮最近点查询和裁剪成功。
   pub_prune_plan_->publish(prune_plan_);
   last_valid_prune_plan_ = clock_->now();
   //RCLCPP_DEBUG(this->get_logger().get_child(name_), "%lu",prune_plan_.poses.size());
@@ -637,56 +675,69 @@ dddmr_sys_core::PlannerState Local_Planner::checkPathBeforeAlignment() {
                                dddmr_sys_core::TRAJECTORY_FOUND;
 }
 
+// 根据最新机器人状态、局部参考路径和实时障碍生成候选轨迹，并选出本控制周期的最优轨迹。
+// traj_gen_name 指定本次使用的轨迹生成器，例如正常行驶使用 omni_drive_simple，
+// 起步或终点对向使用 differential_drive_rotate_shortest_angle。
+// 成功时 best_traj 保存选中轨迹及其 vx/vy/wz；返回值说明成功、感知/TF 异常、
+// 路径阻塞、路径裁剪失败或全部候选被拒绝，实际发布 /cmd_vel 由 p2p_move_base 完成。
 dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string traj_gen_name, base_trajectory::Trajectory& best_traj){
   
+  // 没有里程计就无法从当前实测速度预测未来运动，也不能安全生成控制指令。
   if(!got_odom_){
     RCLCPP_ERROR(this->get_logger().get_child(name_), "Odom is not received.");
     return dddmr_sys_core::TF_FAIL;
   }
 
+  // 感知插件数据缺失或过期时停止本轮规划，避免使用陈旧障碍生成运动轨迹。
   if(!perception_3d_ros_->getStackedPerception()->isSensorOK()){
     RCLCPP_ERROR(this->get_logger().get_child(name_), "Perception 3D is not ok.");
     return dddmr_sys_core::PERCEPTION_MALFUNCTION;
   }
   
+  // 生成器名称必须已在 YAML 的 trajectory_generators.plugins 中加载。
   if(!trajectory_generators_ros_->theoryExists(traj_gen_name)){
     RCLCPP_ERROR(this->get_logger().get_child(name_), "Specified trajectory generator: %s is not declare in yaml nor not consistent", traj_gen_name.c_str());
     return dddmr_sys_core::CONFIGURATION_ERROR;
   }
 
-  //for timing that gives real time even in simulation
+  // 记录本控制周期开始时间，用于检查局部规划是否超过 controller_frequency_ 对应的周期。
   control_loop_time_ = clock_->now();
 
+  // 锁住感知共享数据，使障碍汇总、路径裁剪、轨迹生成和评分使用同一轮数据视图。
   std::unique_lock<perception_3d::StackedPerception::mutex_t> pct_lock(*(perception_3d_ros_->getStackedPerception()->getMutex()));
   
-  //@ update current observation for scoring
-  //@ we need to visualized this for debug/justification
+  // 汇总所有感知插件的 observation 点，后续碰撞评分使用这份实时障碍点云。
   perception_3d_ros_->getStackedPerception()->aggregateObservations();
 
-  //@ forward_prune_/backward_prune_: should adapt to vehicle speed.
-  //@ prune plan are used by trajectory_generators/perception
-  //@ prune plan has to come after mutex lock, because global_plan_ros_sub_ reset global plan kd tree
+  // 从完整 global_plan_ 中截取机器人附近的局部参考段 prune_plan_。
+  // 前向范围至少覆盖 heading_tracking_distance_，确保方向计算有足够的前视路径；
+  // 后向范围保留机器人身后的少量路径，便于最近点和偏差判断。
   prunePlan(std::max(forward_prune_, heading_tracking_distance_), backward_prune_);
 
+  // 发布本轮聚合后的障碍点云，仅用于显示和诊断，不参与额外计算。
   sensor_msgs::msg::PointCloud2 ros2_aggregate_onservation;
   pcl::toROSMsg(*(perception_3d_ros_->getSharedDataPtr()->aggregate_observation_), ros2_aggregate_onservation);
   pub_aggregate_observation_->publish(ros2_aggregate_onservation);
+  // 当前 TF 超时处理已被注释，因此此条件即使满足也不会中止本轮规划。
   if((clock_->now()-trans_gbl2b_.header.stamp).seconds() > 2.0){
     //RCLCPP_ERROR(this->get_logger().get_child(name_), "TF out of date in local planner, the local planner wont go further.");
     //return dddmr_sys_core::TF_FAIL;
   }
 
-  //@ TODO: Compute cuboid of each pose and send to determineIsPathBlock
+  // 将裁剪路径的 PCL 表示共享给 perception_3d，供路径阻塞相关插件使用。
+  // 当前 determineIsPathBlock() 的直接调用仍被注释，具体阻塞意见由已启用插件产生。
   perception_3d_ros_->getSharedDataPtr()->pcl_prune_plan_ = pcl_prune_plan_;
   //perception_3d_ros_->getStackedPerception()->determineIsPathBlock(pcl_prune_plan_);
 
+  // prunePlan() 长时间无法得到有效局部参考段，通常表示机器人离全局路径过远、
+  // 路径为空或最近点查询失败。返回后由任务状态机停车并请求重新规划。
   if((clock_->now()-last_valid_prune_plan_).seconds()>=prune_plane_timeout_){
     RCLCPP_FATAL(this->get_logger().get_child(name_), "Deviate global plan too much, computeVelocityCommand() returns false.");
     return dddmr_sys_core::PRUNE_PLAN_FAIL;
   }
 
-  //Do not create a function to set the parameters unless a nice structure is found
-  //Below assignment of variables is useful when migrate to ROS2
+  // 向轨迹生成器提供本周期输入：当前地图位姿、实测底盘状态、裁剪路径、
+  // 航向前视距离，以及感知层根据障碍计算出的当前允许最大线速度。
   trajectory_generators_ros_->getSharedDataPtr()->robot_pose_ = trans_gbl2b_;
   trajectory_generators_ros_->getSharedDataPtr()->robot_state_ = robot_state_;
   trajectory_generators_ros_->getSharedDataPtr()->ackermann_drive_state_ = ackermann_drive_state_;
@@ -696,17 +747,22 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   trajectory_generators_ros_->getSharedDataPtr()->current_allowed_max_linear_speed_ 
                   = perception_3d_ros_->getSharedDataPtr()->current_allowed_max_linear_speed_;
 
+  // 把评分层计算的航向偏差传给旋转类生成器。initializeTheories_wi_Shared_data()
+  // 会依据最新共享数据重置采样状态，并准备本轮可采样的速度组合。
   traj_shared_data_ = trajectory_generators_ros_->getSharedDataPtr();
   trajectory_generators_ros_->getSharedDataPtr()->rotation_error_ =
     mpc_critics_ros_->getSharedDataPtr()->heading_deviation_;
   const double alignment_error = traj_shared_data_->rotation_error_;
   trajectory_generators_ros_->initializeTheories_wi_Shared_data();
+  // 非正常行驶生成器继续使用初始化前的对向误差，避免初始化过程覆盖旋转目标。
   if (traj_gen_name != "omni_drive_simple")
     traj_shared_data_->rotation_error_ = alignment_error;
 
+  // pose_arr 汇总所有候选轨迹的预测位姿，用于可视化；cuboids_pcl 当前未发布。
   geometry_msgs::msg::PoseArray pose_arr;
   pcl::PointCloud<pcl::PointXYZ> cuboids_pcl;
 
+  // 每个控制周期重新创建候选容器，防止上一周期的轨迹混入本轮评分。
   trajectories_ = std::make_shared<std::vector<base_trajectory::Trajectory>>();
 
   #ifdef HAVE_SYS_TIME_H
@@ -715,11 +771,10 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   gettimeofday(&start, NULL);
   #endif
   
-  //@ We queue all trajectories in trajectories_, then score them one by one in getBestTrajectory()
-  //@ single thread validaed at 0.0004 seconds with 50 samples and 0.04 with 5000 samples
-  //@ omp validated at 0.003 seconds with 50 samples and 0.014 with 5000 samples
-  //@ omp can only be used when samples are large
+  // 按生成器的速度采样表生成全部未来轨迹。每条轨迹包含候选 vx/vy/wz，
+  // 以及在模拟时域内按运动模型积分得到的一系列预测位姿。
   trajectory_generators_ros_->generateAllTrajectories(traj_gen_name, trajectories_);
+  // 将所有有效候选的预测位姿拼入调试消息；这不是最终执行路径。
   for (auto& a_traj : *trajectories_) {
     if(a_traj.getPosesSize()>1)
       trajectory2posearray_cuboids(a_traj, pose_arr, cuboids_pcl);
@@ -735,6 +790,7 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
 
   pose_arr.header.frame_id = perception_3d_ros_->getGlobalUtils()->getGblFrame();
   pose_arr.header.stamp = clock_->now();
+  // trajectory 话题包含全部生成候选，仅供观察；最终选择结果写入 best_traj。
   pub_trajectory_pose_array_->publish(pose_arr);
 
   
@@ -742,19 +798,20 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   //pub_cuboids_.publish(cuboids_pcl);
   
 
-  //@Update data for critics
+  // 锁住评分器并写入本轮统一输入。评分器会把 observation 转为碰撞查询结构，
+  // 并结合 prune_plan_ 对候选轨迹执行碰撞、贴线、前视目标等评分。
   std::unique_lock<mpc_critics::StackedScoringModel::model_mutex_t> critics_lock(*(mpc_critics_ros_->getStackedScoringModelPtr()->getMutex()));
-  //@ unless we come up with a better strcuture
-  //@ keep below for easy migration for ROS2
   mpc_critics_ros_->getSharedDataPtr()->robot_pose_ = trans_gbl2b_;
   mpc_critics_ros_->getSharedDataPtr()->robot_state_ = robot_state_;
   mpc_critics_ros_->getSharedDataPtr()->ackermann_drive_state_ = ackermann_drive_state_;
   mpc_critics_ros_->getSharedDataPtr()->pcl_perception_ = perception_3d_ros_->getSharedDataPtr()->aggregate_observation_;
   mpc_critics_ros_->getSharedDataPtr()->prune_plan_ = prune_plan_;
-  //@ Below function transform prune_plane from nav::msg to pcl type
-  //@ Below function generate kd-tree using aggregate observation
+  // 更新评分共享数据，包括路径/障碍的 PCL 表示及相关 KD-tree。
   mpc_critics_ros_->updateSharedData();
+  // 逐条评分：被任一硬约束拒绝的轨迹记为无效，其余轨迹中最低代价者写入 best_traj。
   getBestTrajectory(traj_gen_name, best_traj);
+  // 正常行驶时增加提前重规划判断：前方参考路径已经阻塞，或者运动候选均因碰撞
+  // 被拒绝而只剩刹车/无有效轨迹时，要求任务状态机立即停车并刷新全局路径。
   if (traj_gen_name == "omni_drive_simple" && obstacle_replan_lookahead_>0) {
     bool collision_rejected_motion=false;
     for (const auto& entry : rejected_trajectories_) {
@@ -774,11 +831,12 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   auto t_diff = clock_->now() - control_loop_time_;
   RCLCPP_DEBUG(this->get_logger().get_child(name_), "Full control cycle time: %.9f", t_diff.seconds());
 
+  // 规划耗时超过一个控制周期时只记录警告，本轮结果仍继续按下方状态返回。
   if(t_diff.seconds() > 1./controller_frequency_){
     RCLCPP_WARN(this->get_logger().get_child(name_), "Local planner control time exceed expect time: %.2f but is %.2f", 1./controller_frequency_, t_diff.seconds());
   }
   
-  //@Loop opinions
+  // 感知插件还可以给出路径阻塞意见：WAIT 表示保持等待，REPLANNING 表示刷新全局路径。
   std::vector<perception_3d::PerceptionOpinion> opinions = perception_3d_ros_->getStackedPerception()->getOpinions();
   for(auto opinion_it=opinions.begin(); opinion_it!=opinions.end();opinion_it++){
     if((*opinion_it)==perception_3d::PATH_BLOCKED_WAIT){
@@ -792,6 +850,7 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   }
 
 
+  // cost_ < 0 表示所有候选都被评分器拒绝；非负则 best_traj 可由上层转换为 /cmd_vel。
   if(best_traj.cost_<0){
     RCLCPP_WARN_THROTTLE(this->get_logger().get_child(name_), *clock_, 5000, "All trajectories are rejected by critics.");
     return dddmr_sys_core::ALL_TRAJECTORIES_FAIL;
@@ -800,7 +859,8 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
     return dddmr_sys_core::TRAJECTORY_FOUND;
   }
   
-  //@ Reset kd tree/observations because it is shared_ptr and copied from perception_ros
+  // 注意：上面的两个分支都会 return，因此当前清理代码实际不可达。
+  // 这里原意是断开评分器持有的感知点云/KD-tree，共享指针生命周期由现有对象管理。
   mpc_critics_ros_->getSharedDataPtr()->pcl_perception_.reset(new pcl::PointCloud<pcl::PointXYZI>());
   mpc_critics_ros_->getSharedDataPtr()->pcl_perception_kdtree_.reset(new pcl::KdTreeFLANN<pcl::PointXYZI>());
 }

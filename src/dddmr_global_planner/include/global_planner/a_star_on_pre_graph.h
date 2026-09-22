@@ -47,6 +47,7 @@ type graph_t is defined here
 /*For perception*/
 #include <perception_3d/perception_3d_ros.h>
 #include <global_planner/nanoflann_pcl.hpp>
+#include <global_planner/cuboid_footprint.h>
 
 typedef struct {
   unsigned int self_index;
@@ -93,10 +94,13 @@ class AstarListPreGraph{
 class A_Star_on_PreGraph{
 
     public:
-      A_Star_on_PreGraph(pcl::PointCloud<pcl::PointXYZI>::Ptr pc_original_z_up, 
+      A_Star_on_PreGraph(
+        pcl::PointCloud<pcl::PointXYZI>::Ptr pc_original_z_up,
+        pcl::PointCloud<pcl::PointXYZI>::Ptr pc_map,
         perception_3d::StaticGraph& static_graph,
         std::shared_ptr<perception_3d::Perception3D_ROS> perception_ros, 
-        double a_star_expanding_radius);
+        double a_star_expanding_radius,
+        const CuboidFootprint & footprint);
       
       ~A_Star_on_PreGraph();
       
@@ -106,15 +110,26 @@ class A_Star_on_PreGraph{
       void getPath( unsigned int start, unsigned int goal, std::vector<unsigned int>& path);
       
       void setupTurningWeight(double m_weight){turning_weight_ = m_weight;}
-      
-      bool isLineOfSightClear(pcl::PointXYZI& pcl_current, pcl::PointXYZI& pcl_expanding, double inscribed_radius);
+
+      bool isFootprintSweepClear(
+        const pcl::PointXYZI & pcl_current,
+        const pcl::PointXYZI & pcl_expanding) const;
+      bool isFootprintSweepClearAtYaw(
+        const pcl::PointXYZI & pcl_current,
+        const pcl::PointXYZI & pcl_expanding, double yaw) const;
+      bool isFootprintPoseClear(const pcl::PointXYZI & center, double yaw) const;
       
     private:
 
       //@ kd-tree for line-of-sight
       nanoflann::KdTreeFLANN<pcl::PointXYZI>::Ptr kdtree_lethal_;
+      nanoflann::KdTreeFLANN<pcl::PointXYZI>::Ptr kdtree_observation_;
+      nanoflann::KdTreeFLANN<pcl::PointXYZI>::Ptr kdtree_map_;
 
       pcl::PointCloud<pcl::PointXYZI>::Ptr pc_original_z_up_;
+      pcl::PointCloud<pcl::PointXYZI>::Ptr pc_map_;
+      pcl::PointCloud<pcl::PointXYZI>::Ptr pc_lethal_;
+      pcl::PointCloud<pcl::PointXYZI>::Ptr pc_observation_;
 
       perception_3d::StaticGraph static_graph_; 
       /*Provide dynamic graph for obstacle avoidance*/
@@ -129,5 +144,6 @@ class A_Star_on_PreGraph{
       double getThetaFromParent2Expanding(pcl::PointXYZI m_pcl_current_parent, pcl::PointXYZI m_pcl_current, pcl::PointXYZI m_pcl_expanding);
 
       double a_star_expanding_radius_;
-};
 
+      CuboidFootprint footprint_;
+};

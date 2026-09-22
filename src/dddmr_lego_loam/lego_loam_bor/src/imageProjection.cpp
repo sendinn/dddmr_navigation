@@ -1061,9 +1061,10 @@ void ImageProjection::zPitchRollFeatureRemoval() {
   pcl::removeNaNFromPointCloud(*patched_ground_, *patched_ground_, tmp_indices);
   pcl::removeNaNFromPointCloud(*patched_ground_edge_, *patched_ground_edge_, tmp_indices2);
   
-  //dsf_patched_ground_.setInputCloud(patched_ground_);
-  //dsf_patched_ground_.filter(*patched_ground_);
-  ds_patched_ground_ = small_gicp::voxelgrid_sampling_omp(*patched_ground_, 0.1, 6);
+  // Preserve the inferred-ground cost in intensity; small_gicp samples XYZ only.
+  dsf_patched_ground_.setDownsampleAllData(true);
+  dsf_patched_ground_.setInputCloud(patched_ground_);
+  dsf_patched_ground_.filter(*ds_patched_ground_);
 
   //dsf_patched_ground_.setInputCloud(patched_ground_edge_);
   //dsf_patched_ground_.filter(*patched_ground_edge_); 

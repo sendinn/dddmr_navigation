@@ -22,11 +22,17 @@ int main() {
   }
   assert(gate.expired(310,10));
   gate.clear();
-  assert(gate.admit(400,false,true)==Admission::Wait); // Stale observations cannot approve a path.
-  assert(gate.admit(401,true,false)==Admission::Replan);
-  assert(gate.admit(401.1,true,false)==Admission::Wait); // Throttle requests while stopped.
-  assert(gate.admit(402,true,true)==Admission::Align); // Only a checked clear path permits turning.
-  assert(gate.expired(410,10)); // Validation alone does not reset the blocked watchdog.
+  // Missing/stale TF, odometry, or perception cannot approve a path and must
+  // not be counted as a persistent obstacle, no matter how long validation waits.
+  assert(gate.admit(400,false,true)==Admission::Wait);
+  assert(gate.admit(500,false,false)==Admission::Wait);
+  assert(!gate.expired(500,10));
+  // The first valid blocked result starts the watchdog and requests replanning.
+  assert(gate.admit(501,true,false)==Admission::Replan);
+  assert(gate.admit(501.1,true,false)==Admission::Wait); // Throttle requests while stopped.
+  assert(gate.admit(502,true,true)==Admission::Align); // Only a checked clear path permits turning.
+  assert(!gate.expired(510.9,10));
+  assert(gate.expired(511,10)); // Validation alone does not reset a real blocked watchdog.
   gate.clear(); // Executable translation clears it, as does starting another goal.
-  assert(!gate.expired(410,10));
+  assert(!gate.expired(511,10));
 }

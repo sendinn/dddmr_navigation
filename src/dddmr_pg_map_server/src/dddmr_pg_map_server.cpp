@@ -226,7 +226,12 @@ void DDDMRPGMapServer::readPoseGraph(){
   std::vector<int> ind_ground;
   pcl::removeNaNFromPointCloud(*map_ground, *map_ground, ind_ground);
   pcl::PointCloud<dddmr_pg_map_server::pcl_t>::Ptr ds_map_ground (new pcl::PointCloud<dddmr_pg_map_server::pcl_t>);
-  ds_map_ground = small_gicp::voxelgrid_sampling_omp(*map_ground, complete_map_voxel_size_, 6);
+  // Keep ground intensity costs through map loading, averaging mixed voxels.
+  pcl::VoxelGrid<dddmr_pg_map_server::pcl_t> ground_filter;
+  ground_filter.setLeafSize(complete_map_voxel_size_, complete_map_voxel_size_, complete_map_voxel_size_);
+  ground_filter.setDownsampleAllData(true);
+  ground_filter.setInputCloud(map_ground);
+  ground_filter.filter(*ds_map_ground);
   RCLCPP_INFO(this->get_logger(), "Ground pointcloud size: %lu", map_ground->points.size());
   RCLCPP_INFO(this->get_logger(), "Ground pointcloud size after down size: %lu", ds_map_ground->points.size());
   sensor_msgs::msg::PointCloud2 ground_pc;

@@ -105,14 +105,23 @@ bool AstarListPreGraph::isFrontierEmpty(){
 
 //@----------------------------------------------------------------------------------------
 
-A_Star_on_PreGraph::A_Star_on_PreGraph(pcl::PointCloud<pcl::PointXYZI>::Ptr pc_original_z_up, 
+A_Star_on_PreGraph::A_Star_on_PreGraph(
+                                  pcl::PointCloud<pcl::PointXYZI>::Ptr pc_original_z_up,
+                                  pcl::PointCloud<pcl::PointXYZI>::Ptr pc_map,
                                   perception_3d::StaticGraph& static_graph, 
                                   std::shared_ptr<perception_3d::Perception3D_ROS> perception_ros,
-                                  double a_star_expanding_radius){
+                                  double a_star_expanding_radius,
+                                  const CuboidFootprint & footprint){
   static_graph_ = static_graph;
   perception_ros_ = perception_ros;
   a_star_expanding_radius_ = a_star_expanding_radius;
+  footprint_ = footprint;
   pc_original_z_up_ = pc_original_z_up;
+  pc_map_ = pc_map;
+  kdtree_map_.reset(new nanoflann::KdTreeFLANN<pcl::PointXYZI>());
+  if (pc_map_ && !pc_map_->empty()) {
+    kdtree_map_->setInputCloud(pc_map_);
+  }
   ASLS_ = new AstarListPreGraph(static_graph_);
 }
 
@@ -156,36 +165,47 @@ double A_Star_on_PreGraph::getThetaFromParent2Expanding(pcl::PointXYZI m_pcl_cur
   return theta_of_vector;
 }
 
-bool A_Star_on_PreGraph::isLineOfSightClear(pcl::PointXYZI& pcl_current, pcl::PointXYZI& pcl_expanding, double inscribed_radius){
+bool A_Star_on_PreGraph::isFootprintSweepClear(
+  const pcl::PointXYZI & pcl_current,
+  const pcl::PointXYZI & pcl_expanding) const
+{
+  return cuboidFootprintSweepClear(
+      pcl_current, pcl_expanding, footprint_, kdtree_map_,
+      pc_map_ ? pc_map_->size() : 0, true) &&
+    cuboidFootprintSweepClear(
+      pcl_current, pcl_expanding, footprint_, kdtree_observation_,
+      pc_observation_ ? pc_observation_->size() : 0, true) &&
+    cuboidFootprintSweepClear(
+      pcl_current, pcl_expanding, footprint_, kdtree_lethal_,
+      pc_lethal_ ? pc_lethal_->size() : 0, false);
+}
 
-  //@ generate line equation
-  float dX =
-      pcl_expanding.x - pcl_current.x;
-  float dY =
-      pcl_expanding.y - pcl_current.y;
-  float dZ =
-      pcl_expanding.z - pcl_current.z;
-  
-  float distance = sqrt(dX*dX + dY*dY + dZ*dZ);
-  distance = distance/inscribed_radius; //sample by every inscribed radius
-  float dt = 1/distance;
-  for(float t=0; t<=1.0+dt; t+=dt){
-    float r = t;
-    if(t>=1.0) //@ make sure we examine t=1.0
-      r = 1.0;
-    pcl::PointXYZI a_pt;
-    a_pt.intensity = 0.0;
-    a_pt.x = pcl_current.x + dX*r;
-    a_pt.y = pcl_current.y + dY*r;
-    a_pt.z = pcl_current.z + dZ*r;
-    std::vector<int> pidx;
-    std::vector<float> prsd;
-    kdtree_lethal_->radiusSearch(a_pt, 2*inscribed_radius, pidx, prsd);
-    if(pidx.size()>1){
-      return false;
-    }
-  }
-  return true;
+bool A_Star_on_PreGraph::isFootprintPoseClear(
+  const pcl::PointXYZI & center, double yaw) const
+{
+  return cuboidFootprintPoseClear(
+      center, yaw, footprint_, kdtree_map_, pc_map_ ? pc_map_->size() : 0, true) &&
+    cuboidFootprintPoseClear(
+      center, yaw, footprint_, kdtree_observation_,
+      pc_observation_ ? pc_observation_->size() : 0, true) &&
+    cuboidFootprintPoseClear(
+      center, yaw, footprint_, kdtree_lethal_,
+      pc_lethal_ ? pc_lethal_->size() : 0, false);
+}
+
+bool A_Star_on_PreGraph::isFootprintSweepClearAtYaw(
+  const pcl::PointXYZI & pcl_current,
+  const pcl::PointXYZI & pcl_expanding, double yaw) const
+{
+  return cuboidFootprintSweepClearAtYaw(
+      pcl_current, pcl_expanding, yaw, footprint_, kdtree_map_,
+      pc_map_ ? pc_map_->size() : 0, true) &&
+    cuboidFootprintSweepClearAtYaw(
+      pcl_current, pcl_expanding, yaw, footprint_, kdtree_observation_,
+      pc_observation_ ? pc_observation_->size() : 0, true) &&
+    cuboidFootprintSweepClearAtYaw(
+      pcl_current, pcl_expanding, yaw, footprint_, kdtree_lethal_,
+      pc_lethal_ ? pc_lethal_->size() : 0, false);
 }
 
 void A_Star_on_PreGraph::getPath(
@@ -210,6 +230,20 @@ void A_Star_on_PreGraph::getPath(
   double inflation_descending_rate = perception_ros_->getGlobalUtils()->getInflationDescendingRate();
   double max_obstacle_distance = perception_ros_->getGlobalUtils()->getMaxObstacleDistance();
 
+  auto stacked_perception = perception_ros_->getStackedPerception();
+  stacked_perception->aggregateLethal();
+  stacked_perception->aggregateObservations();
+  pc_lethal_ = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(
+    *perception_ros_->getSharedDataPtr()->aggregate_lethal_);
+  pc_observation_ = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(
+    *perception_ros_->getSharedDataPtr()->aggregate_observation_);
+  kdtree_lethal_.reset(new nanoflann::KdTreeFLANN<pcl::PointXYZI>());
+  kdtree_observation_.reset(new nanoflann::KdTreeFLANN<pcl::PointXYZI>());
+  if(!pc_lethal_->empty())
+    kdtree_lethal_->setInputCloud(pc_lethal_);
+  if(!pc_observation_->empty())
+    kdtree_observation_->setInputCloud(pc_observation_);
+
   while(!ASLS_->isFrontierEmpty()){ 
     /*Pop minimum F, we leverage prior queue, so we dont need to loop frontier everytime*/
     current_node = ASLS_->getNode_wi_MinimumF();
@@ -225,17 +259,14 @@ void A_Star_on_PreGraph::getPath(
       //@ dGraphValue is the distance to lethal
       double dGraphValue = perception_ros_->get_min_dGraphValue((*it).first);
 
-      /*This is for lethal*/
-      if(dGraphValue<inscribed_radius){
-        //ROS_DEBUG("%.2f,%.2f,%.2f, v: %.2f",pc_original_z_up_->points[(*it).first].x,pc_original_z_up_->points[(*it).first].y,pc_original_z_up_->points[(*it).first].z, dGraphValue);
-        continue;
-      }
-      
       float current_expanding_g = (*it).second;
 
       pcl::PointXYZI pcl_current = pc_original_z_up_->points[current_node.self_index];
       pcl::PointXYZI pcl_current_parent = pc_original_z_up_->points[current_node.parent_index];
       pcl::PointXYZI pcl_expanding = pc_original_z_up_->points[(*it).first];
+
+      if(!isFootprintSweepClear(pcl_current, pcl_expanding))
+        continue;
 
       double factor = exp(-1.0 * inflation_descending_rate * (dGraphValue - inscribed_radius));
 

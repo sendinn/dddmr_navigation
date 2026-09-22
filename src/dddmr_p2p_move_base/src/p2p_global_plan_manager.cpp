@@ -83,15 +83,29 @@ void P2PGlobalPlanManager::initial(){
 
 }
 
-void P2PGlobalPlanManager::resume(){
+void P2PGlobalPlanManager::resume(bool force_full_replan){
   std::unique_lock<std::mutex> lock(access_);
+  // DWA normally treats repeated requests for the same stamped goal as a
+  // cache query and only repairs the short look-ahead prefix.  Once the local
+  // planner has rejected that route because of an obstacle, keeping the same
+  // stamp can therefore keep attaching the blocked reference tail forever.
+  // A fresh stamp deliberately makes DWA rebuild the whole route from the
+  // current robot pose to the retained final goal.
+  if (force_full_replan)
+    goal_.header.stamp = clock_->now();
   ++generation_;
   failed_ = false;
+  no_path_active_ = false;
+  no_path_event_ = false;
   last_result_time_ = std::chrono::steady_clock::now();
   global_path_.poses.clear();
   is_planning_ = false;
   loop_timer_->reset();
-  RCLCPP_INFO(this->get_logger(), "Global plan manager is resumed");
+  if (force_full_replan)
+    RCLCPP_WARN(this->get_logger(),
+      "Global plan manager requests a full route rebuild for the retained goal");
+  else
+    RCLCPP_INFO(this->get_logger(), "Global plan manager is resumed");
 }
 
 void P2PGlobalPlanManager::pause(){
@@ -100,6 +114,8 @@ void P2PGlobalPlanManager::pause(){
   loop_timer_->cancel();
   global_path_.poses.clear();
   is_planning_ = false;
+  no_path_active_ = false;
+  no_path_event_ = false;
 }
 
 void P2PGlobalPlanManager::stop(){
@@ -174,7 +190,9 @@ void P2PGlobalPlanManager::global_planner_client_result_callback(const rclcpp_ac
       //RCLCPP_INFO(this->get_logger(), "Global Planner ---> %s: Global plan is found", global_planner_action_name_.c_str());
       break;
     case rclcpp_action::ResultCode::ABORTED:
-      RCLCPP_ERROR(this->get_logger(), "Global Planner ---> %s: Goal was aborted", global_planner_action_name_.c_str());
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *clock_, 2000,
+        "Global Planner ---> %s: no path in current obstacle snapshot; keep stopped and retry",
+        global_planner_action_name_.c_str());
       break;
     case rclcpp_action::ResultCode::CANCELED:
       RCLCPP_ERROR(this->get_logger(), "Global Planner ---> %s: Goal was canceled", global_planner_action_name_.c_str());
@@ -183,13 +201,27 @@ void P2PGlobalPlanManager::global_planner_client_result_callback(const rclcpp_ac
       RCLCPP_ERROR(this->get_logger(), "Global Planner ---> %s: Unknown result code", global_planner_action_name_.c_str());
       break;
   }
-  if (result.code != rclcpp_action::ResultCode::SUCCEEDED ||
-      !result.result || result.result->path.poses.empty()) {
+  last_result_time_ = std::chrono::steady_clock::now();
+  const bool valid_no_path_response =
+    result.code == rclcpp_action::ResultCode::ABORTED ||
+    (result.code == rclcpp_action::ResultCode::SUCCEEDED &&
+      (!result.result || result.result->path.poses.empty()));
+  if (valid_no_path_response) {
+    // An empty collision-aware plan is a valid, retriable planner response.
+    // Treating it as a transport failure used to abort navigation after one
+    // transient lidar frame, bypassing planner_patience entirely.
+    failed_ = false;
+    if (!no_path_active_) no_path_event_ = true;
+    no_path_active_ = true;
+    global_path_.poses.clear();
+  } else if (result.code == rclcpp_action::ResultCode::SUCCEEDED && result.result) {
+    failed_ = false;
+    no_path_active_ = false;
+    no_path_event_ = false;
+    global_path_ = result.result->path;
+  } else {
     failed_ = true;
     global_path_.poses.clear();
-  } else {
-    global_path_ = result.result->path;
-    last_result_time_ = std::chrono::steady_clock::now();
   }
   is_planning_ = false;
 }
@@ -205,6 +237,13 @@ bool P2PGlobalPlanManager::hasPlan(){
   if(!is_planning_ && !global_path_.poses.empty())
     return true;
   return false;
+}
+
+bool P2PGlobalPlanManager::consumeNoPathEvent(){
+  std::unique_lock<std::mutex> lock(access_);
+  const bool event = no_path_event_;
+  no_path_event_ = false;
+  return event;
 }
 
 bool P2PGlobalPlanManager::planningUnsafe(){

@@ -30,6 +30,8 @@
 */
 #include <global_planner/dynamic_window_aware_global_planner.h>
 
+#include <algorithm>
+
 using namespace std::chrono_literals;
 
 namespace global_planner
@@ -260,26 +262,33 @@ void DWA_GlobalPlanner::determineDWAPlan(){
     ipt.z = pcl_global_path_->points[pivot].z;
     perception_3d_ros_->getSharedDataPtr()->kdtree_ground_->radiusSearch(ipt, 0.25, pointIdxRadiusSearch, pointRadiusSquaredDistance);
     
-    double inscribed_radius = perception_3d_ros_->getGlobalUtils()->getInscribedRadius();
     if(pointIdxRadiusSearch.empty()){
       look_ahead_step+=1.0;
       dwa_goal_clear = false;
       RCLCPP_INFO_THROTTLE(this->get_logger(), *clock_, 1000,  "No ground is found for DWA goal at: %.2f, %.2f, %.2f", pcl_global_path_->points[pivot].x, pcl_global_path_->points[pivot].y, pcl_global_path_->points[pivot].z);
     }
     else{
-      for(auto it=pointIdxRadiusSearch.begin();it!=pointIdxRadiusSearch.end();it++){
-        //@ dGraphValue is the distance to lethal
-        double dGraphValue = perception_3d_ros_->get_min_dGraphValue((*it));
-        /*This is for lethal*/
-        if(dGraphValue<inscribed_radius){
-          look_ahead_step+=1.0;
-          dwa_goal_clear = false;
-          RCLCPP_INFO_THROTTLE(this->get_logger(), *clock_, 1000, "DWA goal is blocked at: %.2f, %.2f, %.2f", pcl_global_path_->points[pivot].x, pcl_global_path_->points[pivot].y, pcl_global_path_->points[pivot].z);
-          break;
-        }
-        else{
-          dwa_goal_clear = true;
-        }
+      const size_t pivot_index = static_cast<size_t>(pivot);
+      const size_t last_index = pcl_global_path_->size() - 1;
+      const size_t heading_from = pivot_index == last_index && pivot_index > 0 ?
+        pivot_index - 1 : pivot_index;
+      const size_t heading_to = std::min(pivot_index + 1, last_index);
+      const double yaw = std::atan2(
+        pcl_global_path_->points[heading_to].y - pcl_global_path_->points[heading_from].y,
+        pcl_global_path_->points[heading_to].x - pcl_global_path_->points[heading_from].x);
+      pcl::PointXYZI cuboid_center;
+      cuboid_center.x = ipt.x;
+      cuboid_center.y = ipt.y;
+      cuboid_center.z = ipt.z;
+      if (!global_planner_->isFootprintPoseClear(cuboid_center, yaw)) {
+        look_ahead_step += 1.0;
+        dwa_goal_clear = false;
+        RCLCPP_INFO_THROTTLE(
+          this->get_logger(), *clock_, 1000,
+          "DWA goal cuboid is blocked at: %.2f, %.2f, %.2f",
+          ipt.x, ipt.y, ipt.z);
+      } else {
+        dwa_goal_clear = true;
       }
     }
     dwa_pivot = pivot;
@@ -290,6 +299,10 @@ void DWA_GlobalPlanner::determineDWAPlan(){
   dwa_goal.pose.position.x = pcl_global_path_->points[dwa_pivot].x;
   dwa_goal.pose.position.y = pcl_global_path_->points[dwa_pivot].y;
   dwa_goal.pose.position.z = pcl_global_path_->points[dwa_pivot].z;
+  // This is an intermediate goal on the reference path. Preserve its path
+  // heading; a default all-zero quaternion would be interpreted as yaw=0 and
+  // can make the rectangular body appear sideways inside a narrow corridor.
+  dwa_goal.pose.orientation = global_path_.poses[dwa_pivot].pose.orientation;
   
   RCLCPP_DEBUG(this->get_logger(), "DWA pivot: %d is at %.2f, %.2f, %.2f with start: %.2f, %.2f, %.2f", 
         dwa_pivot, dwa_goal.pose.position.x, dwa_goal.pose.position.y, dwa_goal.pose.position.z,

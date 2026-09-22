@@ -453,6 +453,12 @@ void MultiLayerSpinningLidar::selfMark(){
   std::vector<int> indices;
   pcl_msg_gbl_->is_dense = false;
   pcl::removeNaNFromPointCloud(*pcl_msg_gbl_, *pcl_msg_gbl_, indices);
+  // Keep the current global-frame obstacle cloud available through
+  // getObservation().  Previously this snapshot was populated only when the
+  // plugin ran in local-planner mode, so the global A* could see projected
+  // lethal graph nodes but not the live 3D points that the local cuboid check
+  // used to reject its path.
+  pcl::copyPointCloud(*pcl_msg_gbl_, *sensor_current_observation_);
   
   pcl::search::KdTree<pcl::PointXYZ>::Ptr pc_kdtree (new pcl::search::KdTree<pcl::PointXYZ>);
   pc_kdtree->setInputCloud (pcl_msg_gbl_);

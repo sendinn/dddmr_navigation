@@ -89,6 +89,13 @@ class GlobalPlanner : public rclcpp::Node {
       void initial(const std::shared_ptr<perception_3d::Perception3D_ROS>& perception_3d);
       
       nav_msgs::msg::Path makeROSPlan(const geometry_msgs::msg::PoseStamped& start, const geometry_msgs::msg::PoseStamped& goal);
+      const CuboidFootprint & getFootprint() const {return footprint_;}
+      bool isFootprintPoseClear(const pcl::PointXYZI & center, double yaw) const;
+      bool isFootprintSweepClear(
+        const pcl::PointXYZI & start, const pcl::PointXYZI & end) const;
+      bool isFootprintSweepClearAtYaw(
+        const pcl::PointXYZI & start, const pcl::PointXYZI & end,
+        double yaw) const;
       std::shared_ptr<dddmr_sys_core::action::GetPlan::Result> global_plan_result_;
 
     private:
@@ -128,6 +135,7 @@ class GlobalPlanner : public rclcpp::Node {
       double turning_weight_;
       bool enable_detail_log_;
       double a_star_expanding_radius_;
+      CuboidFootprint footprint_;
       size_t static_ground_size_;
       bool use_pre_graph_;
       double find_start_tolerance_;

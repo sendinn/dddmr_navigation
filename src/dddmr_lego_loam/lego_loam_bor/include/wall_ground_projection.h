@@ -5,6 +5,10 @@
 #include <cmath>
 
 namespace wall_ground_projection {
+// Empirical A* cost for inferred wall-to-ground points. Ordinary ground stays
+// at zero; the planner adds the neighborhood mean intensity to each edge cost.
+inline constexpr float kProjectedGroundIntensity = 1.0f;
+
 // Installation-pitch-corrected frame; geometric heuristic, not semantic walls.
 // Never reuse inferred points as seeds.
 template<class Point>
@@ -56,7 +60,9 @@ pcl::PointCloud<Point> project(const pcl::PointCloud<Point>& observed,
     const double z = mean.z() - (normal.x()*(p.x-mean.x()) + normal.y()*(p.y-mean.y()))/normal.z();
     const double height = p.z-z;
     if (!std::isfinite(z) || height < .10 || height > 1.0) continue;
-    Point projected = p; projected.z = z; projected.intensity = 0;
+    Point projected = p;
+    projected.z = z;
+    projected.intensity = kProjectedGroundIntensity;
     result.push_back(projected);
   }
   return result;
