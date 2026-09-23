@@ -80,12 +80,100 @@ inline std::vector<double> singleAxisTargets(double lower, double upper,
   return out;
 }
 
+// Full candidate sampling and single-axis command admission are deliberately
+// separate. Mixed-axis candidates may be visualized and scored, but only a
+// stopped command or the currently admitted axis/direction may be executed.
+inline bool singleAxisCommandAllowed(double x, double y, double yaw,
+    int axis, int sign,
+    double speed_cap = std::numeric_limits<double>::infinity(),
+    double epsilon = 1e-6) {
+  const std::array<double,3> command{x, y, yaw};
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(yaw) ||
+      std::isnan(speed_cap) || speed_cap < 0 ||
+      !std::isfinite(epsilon) || epsilon < 0) return false;
+  const bool stopped = std::abs(x) <= epsilon && std::abs(y) <= epsilon &&
+    std::abs(yaw) <= epsilon;
+  if (stopped) return true;
+  if (axis < 0 || axis > 2 || (sign != 1 && sign != -1)) return false;
+  for (int index = 0; index < 3; ++index)
+    if (index != axis && std::abs(command[index]) > epsilon) return false;
+  return sign * command[axis] > epsilon &&
+    std::abs(command[axis]) <= speed_cap + epsilon;
+}
+
+inline int bestSingleAxisMotion(
+    const std::vector<std::array<double,4>>& candidates, int axis, int sign,
+    double speed_cap = std::numeric_limits<double>::infinity()) {
+  int best = -1;
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    const auto& candidate = candidates[index];
+    if (!std::isfinite(candidate[3]) || candidate[3] < 0 ||
+        !singleAxisCommandAllowed(
+          candidate[0], candidate[1], candidate[2], axis, sign, speed_cap)) continue;
+    const bool stopped = std::abs(candidate[0]) <= 1e-6 &&
+      std::abs(candidate[1]) <= 1e-6 && std::abs(candidate[2]) <= 1e-6;
+    if (!stopped && (best < 0 || candidate[3] < candidates[best][3]))
+      best = static_cast<int>(index);
+  }
+  return best;
+}
+
+struct SingleAxisCandidateChoice {
+  int index = -1;
+  int axis = -1;
+  int sign = 1;
+};
+
+// Choose the lowest-cost collision-free pure Y or pure-yaw command. Mixed
+// commands and X commands remain diagnostic candidates and cannot enter the
+// avoidance state.
+inline SingleAxisCandidateChoice choosePureAvoidanceMotion(
+    const std::vector<std::array<double,4>>& candidates,
+    double y_speed_cap = std::numeric_limits<double>::infinity(),
+    double yaw_speed_cap = std::numeric_limits<double>::infinity()) {
+  SingleAxisCandidateChoice best;
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    const auto& candidate = candidates[index];
+    if (!std::isfinite(candidate[3]) || candidate[3] < 0) continue;
+    for (int axis : {1, 2}) {
+      const double value = candidate[axis];
+      if (std::abs(value) <= 1e-6) continue;
+      const int sign = value > 0 ? 1 : -1;
+      const double cap = axis == 1 ? y_speed_cap : yaw_speed_cap;
+      if (!singleAxisCommandAllowed(candidate[0], candidate[1], candidate[2],
+                                    axis, sign, cap)) continue;
+      if (best.index < 0 || candidate[3] < candidates[best.index][3])
+        best = {static_cast<int>(index), axis, sign};
+    }
+  }
+  return best;
+}
+
+inline int chooseSingleAxisMotionOrBrake(
+    const std::vector<std::array<double,4>>& candidates, int axis, int sign,
+    double speed_cap = std::numeric_limits<double>::infinity()) {
+  const int moving = bestSingleAxisMotion(candidates, axis, sign, speed_cap);
+  int brake = -1;
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    const auto& candidate = candidates[index];
+    if (!std::isfinite(candidate[3]) || candidate[3] < 0 ||
+        !singleAxisCommandAllowed(
+          candidate[0], candidate[1], candidate[2], axis, sign, speed_cap)) continue;
+    const bool stopped = std::abs(candidate[0]) <= 1e-6 &&
+      std::abs(candidate[1]) <= 1e-6 && std::abs(candidate[2]) <= 1e-6;
+    if (stopped && (brake < 0 || candidate[3] < candidates[brake][3]))
+      brake = static_cast<int>(index);
+  }
+  return moving >= 0 ? moving : brake;
+}
+
 class SingleAxisTracking {
  public:
   // -1: brake; 0: X; 1: Y; 2: yaw. Hysteresis avoids stage chattering.
   int choose(const TrackingErrors& e, const std::array<double,3>& velocity,
              int64_t stamp, bool fresh, double yaw_enter, double yaw_exit,
-             double lateral_enter, double lateral_exit, bool allow_yaw_translation = false) {
+             double lateral_enter, double lateral_exit, bool allow_yaw_translation = false,
+             int forced_axis = -1, int forced_sign = 1) {
     if (!e.valid || !std::isfinite(e.forward) ||
         !std::isfinite(e.heading) || !std::isfinite(e.lateral)) {
       stop_reason_ = "路径跟踪误差无效"; return reset();
@@ -107,6 +195,13 @@ class SingleAxisTracking {
     int wanted = rotating_ ? 2 : lateral_ ? 1 : 0;
     double error = wanted == 2 ? e.heading : wanted == 1 ? e.lateral : e.forward;
     int sign = error >= 0 ? 1 : -1;
+    if (forced_axis >= 0) {
+      if (forced_axis > 2 || (forced_sign != 1 && forced_sign != -1)) {
+        stop_reason_ = "避障单轴请求无效"; return reset();
+      }
+      wanted = forced_axis;
+      sign = forced_sign;
+    }
     bool other_moving = false, stopped = true;
     for (int i=0; i<3; ++i) {
       bool moving = std::abs(velocity[i]) > (i==2 ? 0.05 : 0.03);

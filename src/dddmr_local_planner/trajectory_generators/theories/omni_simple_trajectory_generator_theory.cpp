@@ -53,11 +53,27 @@ void OmniSimpleTrajectoryGeneratorTheory::onInitialize(){
   axis_yaw_exit_ = node_->declare_parameter<double>(name_ + ".axis_yaw_exit", 0.0872664626);
   axis_lateral_enter_ = node_->declare_parameter<double>(name_ + ".axis_lateral_enter", 0.10);
   axis_lateral_exit_ = node_->declare_parameter<double>(name_ + ".axis_lateral_exit", 0.05);
+  axis_obstacle_avoidance_ = node_->declare_parameter<bool>(
+    name_ + ".axis_obstacle_avoidance", false);
+  avoidance_clear_cycles_ = node_->declare_parameter<int>(
+    name_ + ".axis_avoidance_clear_cycles", 3);
+  avoidance_switch_cycles_ = node_->declare_parameter<int>(
+    name_ + ".axis_avoidance_switch_cycles", 3);
+  avoidance_timeout_ = node_->declare_parameter<double>(
+    name_ + ".axis_avoidance_timeout", 8.0);
+  avoidance_retry_delay_ = node_->declare_parameter<double>(
+    name_ + ".axis_avoidance_retry_delay", 2.0);
   if (!std::isfinite(axis_yaw_enter_) || !std::isfinite(axis_yaw_exit_) ||
       !std::isfinite(axis_lateral_enter_) || !std::isfinite(axis_lateral_exit_) ||
       axis_yaw_exit_ <= 0 || axis_yaw_enter_ < axis_yaw_exit_ || axis_yaw_enter_ >= 1.5707963268 ||
       axis_lateral_exit_ <= 0 || axis_lateral_enter_ <= axis_lateral_exit_)
     throw std::invalid_argument("Invalid single-axis tracking thresholds");
+  if (avoidance_clear_cycles_ < 1 || avoidance_clear_cycles_ > 100 ||
+      avoidance_switch_cycles_ < 1 || avoidance_switch_cycles_ > 100 ||
+      !std::isfinite(avoidance_timeout_) || avoidance_timeout_ < 0.5 || avoidance_timeout_ > 60.0 ||
+      !std::isfinite(avoidance_retry_delay_) || avoidance_retry_delay_ < 0.0 ||
+      avoidance_retry_delay_ > 30.0)
+    throw std::invalid_argument("Invalid single-axis obstacle avoidance parameters");
   sample_braking_commands_ = node_->declare_parameter<bool>(name_ + ".sample_braking_commands", false);
   RCLCPP_INFO(node_->get_logger().get_child(name_), "sample_braking_commands: %s",
       sample_braking_commands_ ? "true" : "false");
@@ -291,6 +307,12 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
   Eigen::Vector3f acc_lim = limits_->getAccLimits();
   next_sample_index_ = 0;
   sample_params_.clear();
+  admitted_axis_ = -1;
+  admitted_sign_ = 1;
+  admitted_speed_cap_ = 0.0;
+  desired_x_speed_cap_ = 0.0;
+  shared_data_->single_axis_avoidance_active_ = false;
+  shared_data_->single_axis_avoidance_has_safe_command_ = false;
 
   double min_vel_x = limits_->min_vel_x;
   double max_vel_x = limits_->max_vel_x;
@@ -349,7 +371,7 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
     // Permit braking toward zero even when measured overspeed excludes zero
     // from the one-cycle window. generateTrajectory still integrates the
     // measured velocity and finite deceleration; it never assumes instant stop.
-    if (sample_braking_commands_) {
+    if (sample_braking_commands_ || single_axis_tracking_) {
       for (int axis = 0; axis < 3; ++axis) {
         if (command_min[axis] <= 0.0f && command_max[axis] >= 0.0f) {
           min_vel[axis] = std::min(min_vel[axis], 0.0f);
@@ -357,6 +379,10 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
         }
       }
     }
+    // The single-axis policy decides only which scored command may be sent.
+    // Candidate generation below always retains the complete vx * vy * wz
+    // lattice so collision diagnostics and visualization are not collapsed to
+    // the currently admitted axis.
     if (single_axis_tracking_) {
       std::vector<std::array<double,2>> path;
       for (const auto& p : shared_data_->prune_plan_.poses)
@@ -375,59 +401,62 @@ void OmniSimpleTrajectoryGeneratorTheory::initialise(){
       const auto tf_stamp = rclcpp::Time(shared_data_->robot_pose_.header.stamp);
       const double age = (now - stamp).seconds();
       const double tf_age = (now - tf_stamp).seconds();
-      const int axis = axis_policy_.choose(errors, {v.linear.x, v.linear.y, v.angular.z},
+      const int64_t now_ns = now.nanoseconds();
+      if ((avoidance_active_ || avoidance_returning_to_x_) &&
+          (avoidance_started_ns_ <= 0 || now_ns < avoidance_started_ns_ ||
+           static_cast<double>(now_ns - avoidance_started_ns_) * 1e-9 > avoidance_timeout_)) {
+        RCLCPP_WARN(node_->get_logger().get_child(name_),
+          "单轴避障超时 %.2f s，停车并恢复全局重规划", avoidance_timeout_);
+        avoidance_active_ = false;
+        avoidance_returning_to_x_ = false;
+        avoidance_axis_ = -1;
+        avoidance_x_clear_count_ = 0;
+        avoidance_axis_blocked_count_ = 0;
+        avoidance_started_ns_ = 0;
+        avoidance_cooldown_until_ns_ = now_ns +
+          static_cast<int64_t>(avoidance_retry_delay_ * 1e9);
+      }
+      desired_x_sign_ = errors.forward >= 0 ? 1 : -1;
+      desired_x_speed_cap_ = std::max(std::abs(command_min[0]), std::abs(command_max[0]));
+      if (limits_->max_vel_trans >= 0)
+        desired_x_speed_cap_ = std::min(desired_x_speed_cap_, limits_->max_vel_trans);
+      if (shared_data_->current_allowed_max_linear_speed_ > 0)
+        desired_x_speed_cap_ = std::min(
+          desired_x_speed_cap_, shared_data_->current_allowed_max_linear_speed_);
+      const int forced_axis = avoidance_active_ ? avoidance_axis_ :
+        avoidance_returning_to_x_ ? 0 : -1;
+      const int forced_sign = avoidance_active_ ? avoidance_sign_ : desired_x_sign_;
+      admitted_axis_ = axis_policy_.choose(errors, {v.linear.x, v.linear.y, v.angular.z},
         stamp.nanoseconds(), dddmr_sys_core::motionTimestampFresh(stamp.nanoseconds(), age) &&
         dddmr_sys_core::motionTimestampFresh(tf_stamp.nanoseconds(), tf_age),
         axis_yaw_enter_, axis_yaw_exit_, axis_lateral_enter_, axis_lateral_exit_,
-        true);  // Same-turn translational coupling also applies during slowdown.
-      if (axis < 0) {
+        true, forced_axis, forced_sign);  // Forced avoidance still uses stop-before-switch.
+      admitted_sign_ = admitted_axis_ >= 0 ? axis_policy_.sign() : 1;
+      if (admitted_axis_ < 0) {
         RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
           "停车原因：%s; heading_error=%.4f rad, lateral_error=%.4f m, forward_error=%.4f m, measured=(%.4f,%.4f,%.4f), odom_age=%.3f s, tf_age=%.3f s, robot_yaw=%.4f rad, reference=(%.3f,%.3f)->(%.3f,%.3f), path_points=%zu",
           axis_policy_.stopReason(), errors.heading, errors.lateral, errors.forward,
           v.linear.x, v.linear.y, v.angular.z, age, tf_age, yaw,
           errors.reference_start[0], errors.reference_start[1],
           errors.reference_end[0], errors.reference_end[1], path.size());
-        sample_params_.push_back(Eigen::Vector3f::Zero());
       } else {
-        const int sign = axis_policy_.sign();
-        const double samples = axis == 0 ? params_->linear_x_sample :
-          axis == 1 ? params_->linear_y_sample : params_->angular_z_sample;
-        // SDK commands are targets, not velocities that must already be
-        // reachable in one 0.1 s cycle. Otherwise a startup dead zone traps
-        // sampling near zero forever. Score the complete acceleration rollout.
-        double cap = axis == 2 ? (limits_->min_vel_theta >= max_vel_th ? max_vel_th :
-          std::min(max_vel_th, std::max(limits_->min_vel_theta, std::abs(errors.heading)))) :
-                                std::max(std::abs(command_min[axis]), std::abs(command_max[axis]));
-        if (axis != 2 && limits_->max_vel_trans >= 0)
-          cap = std::min(cap, limits_->max_vel_trans);
-        if (axis != 2 && shared_data_->current_allowed_max_linear_speed_ > 0)
-          cap = std::min(cap, shared_data_->current_allowed_max_linear_speed_);
-        const double minimum = axis == 2 ? limits_->min_vel_theta : limits_->min_vel_trans;
-        if (axis == 2) {
+        admitted_speed_cap_ = admitted_axis_ == 2 ? max_vel_th :
+          std::max(std::abs(command_min[admitted_axis_]),
+                   std::abs(command_max[admitted_axis_]));
+        if (admitted_axis_ != 2 && limits_->max_vel_trans >= 0)
+          admitted_speed_cap_ = std::min(admitted_speed_cap_, limits_->max_vel_trans);
+        if (admitted_axis_ != 2 && shared_data_->current_allowed_max_linear_speed_ > 0)
+          admitted_speed_cap_ = std::min(
+            admitted_speed_cap_, shared_data_->current_allowed_max_linear_speed_);
+        if (admitted_axis_ == 2 && !avoidance_active_) {
+          const double cap = limits_->min_vel_theta >= max_vel_th ? max_vel_th :
+            std::min(max_vel_th, std::max(limits_->min_vel_theta, std::abs(errors.heading)));
+          admitted_speed_cap_ = cap;
           RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
             "旋转减速：剩余角度=%.2f deg, 候选角速度上限=%.3f rad/s",
             errors.heading * 180.0 / std::acos(-1.0), cap);
         }
-        const auto targets = singleAxisTargets(command_min[axis], command_max[axis],
-          minimum, static_cast<int>(samples), sign, cap);
-        for (double speed : targets) {
-          Eigen::Vector3f command = Eigen::Vector3f::Zero();
-          command[axis] = speed;
-          if (isMotorConstraintSatisfied(command)) sample_params_.push_back(command);
-        }
       }
-      // If no legal target satisfies the direction and speed limits, brake
-      // and retry; do not return an empty set that restarts global alignment.
-      if (sample_params_.empty()) {
-        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-          "停车原因：当前轴/方向没有满足速度限制的采样; axis=%d, sign=%d", axis, axis_policy_.sign());
-        sample_params_.push_back(Eigen::Vector3f::Zero());
-      }
-      if (sample_braking_commands_ && axis >= 0 &&
-          !sample_params_.front().isZero(0.0f))
-        sample_params_.push_back(Eigen::Vector3f::Zero());
-      // Every sample is simulated and collision-scored with this exact command.
-      return;
     }
     Eigen::Vector3f vel_samp = Eigen::Vector3f::Zero();
     trajectory_generators::VelocityIterator x_it(min_vel[0], max_vel[0], params_->linear_x_sample);
@@ -654,15 +683,151 @@ Eigen::Vector3f OmniSimpleTrajectoryGeneratorTheory::computeNewPositions(const E
 void OmniSimpleTrajectoryGeneratorTheory::expertScoring(std::vector<base_trajectory::Trajectory>& accepted_trajectories,
                                             std::map<std::string, std::vector<base_trajectory::Trajectory>>& rejected_trajectories, 
                                               base_trajectory::Trajectory& best_traj){
-  if (!sample_braking_commands_ || !single_axis_tracking_) {
+  if (!single_axis_tracking_) {
     TrajectoryGeneratorTheory::expertScoring(accepted_trajectories, rejected_trajectories, best_traj);
     return;
   }
   std::vector<std::array<double,4>> candidates;
+  candidates.reserve(accepted_trajectories.size());
   for (const auto& t : accepted_trajectories)
     candidates.push_back({t.xv_,t.yv_,t.thetav_,t.cost_});
-  const int best=chooseMotionOrBrake(candidates);
-  best_traj.cost_=-1;
-  if (best>=0) best_traj=accepted_trajectories[best];
+  best_traj.cost_ = -1;
+  shared_data_->single_axis_avoidance_active_ =
+    avoidance_active_ || avoidance_returning_to_x_;
+  shared_data_->single_axis_avoidance_has_safe_command_ = false;
+
+  const double y_cap = limits_->max_vel_trans >= 0 ?
+    std::min(std::max(std::abs(limits_->min_vel_y), std::abs(limits_->max_vel_y)),
+             limits_->max_vel_trans) :
+    std::max(std::abs(limits_->min_vel_y), std::abs(limits_->max_vel_y));
+  const double yaw_cap = limits_->max_vel_theta;
+  const int x_motion = bestSingleAxisMotion(
+    candidates, 0, desired_x_sign_, desired_x_speed_cap_);
+  const auto alternative = choosePureAvoidanceMotion(candidates, y_cap, yaw_cap);
+  int best = chooseSingleAxisMotionOrBrake(
+    candidates, admitted_axis_, admitted_sign_, admitted_speed_cap_);
+
+  if (!axis_obstacle_avoidance_) {
+    if (best >= 0) best_traj = accepted_trajectories[best];
+  } else if (!avoidance_active_ && !avoidance_returning_to_x_) {
+    const bool x_was_selected = admitted_axis_ == 0;
+    if (x_was_selected && x_motion < 0 && alternative.index >= 0 &&
+        node_->now().nanoseconds() >= avoidance_cooldown_until_ns_) {
+      avoidance_active_ = true;
+      avoidance_axis_ = alternative.axis;
+      avoidance_sign_ = alternative.sign;
+      avoidance_x_clear_count_ = 0;
+      avoidance_axis_blocked_count_ = 0;
+      avoidance_started_ns_ = node_->now().nanoseconds();
+      shared_data_->single_axis_avoidance_active_ = true;
+      shared_data_->single_axis_avoidance_has_safe_command_ = true;
+      // The alternative is known safe, but this cycle must command the brake;
+      // the policy admits it only after three new stopped odometry samples.
+      best = chooseSingleAxisMotionOrBrake(candidates, -1, 1, 0.0);
+      RCLCPP_WARN(node_->get_logger().get_child(name_),
+        "纯 X 无安全候选，进入单轴避障：先停车，再锁定 %s%s",
+        avoidance_axis_ == 1 ? "Y" : "Yaw", avoidance_sign_ > 0 ? "+" : "-");
+    }
+    if (best >= 0) best_traj = accepted_trajectories[best];
+  } else if (avoidance_returning_to_x_) {
+    if (x_motion < 0) {
+      ++avoidance_axis_blocked_count_;
+      if (avoidance_axis_blocked_count_ >= avoidance_switch_cycles_) {
+        avoidance_returning_to_x_ = false;
+        avoidance_axis_blocked_count_ = 0;
+        if (alternative.index >= 0) {
+          avoidance_active_ = true;
+          avoidance_axis_ = alternative.axis;
+          avoidance_sign_ = alternative.sign;
+          avoidance_x_clear_count_ = 0;
+          shared_data_->single_axis_avoidance_active_ = true;
+          shared_data_->single_axis_avoidance_has_safe_command_ = true;
+          RCLCPP_WARN(node_->get_logger().get_child(name_),
+            "切回 X 时安全候选消失，重新锁定 %s%s",
+            avoidance_axis_ == 1 ? "Y" : "Yaw", avoidance_sign_ > 0 ? "+" : "-");
+        } else {
+          shared_data_->single_axis_avoidance_active_ = false;
+        }
+      } else {
+        shared_data_->single_axis_avoidance_active_ = true;
+        // Stay stopped for a bounded number of cycles while collision scoring
+        // settles. A known-safe alternative keeps this transition recoverable.
+        shared_data_->single_axis_avoidance_has_safe_command_ = alternative.index >= 0;
+      }
+      best = chooseSingleAxisMotionOrBrake(candidates, -1, 1, 0.0);
+    } else if (admitted_axis_ == 0 && admitted_sign_ == desired_x_sign_) {
+      avoidance_axis_blocked_count_ = 0;
+      best = x_motion;
+      avoidance_returning_to_x_ = false;
+      avoidance_axis_ = -1;
+      avoidance_started_ns_ = 0;
+      RCLCPP_INFO(node_->get_logger().get_child(name_),
+        "单轴避障完成，已停稳并恢复纯 X 指令");
+    } else {
+      best = chooseSingleAxisMotionOrBrake(candidates, -1, 1, 0.0);
+      shared_data_->single_axis_avoidance_active_ = true;
+      shared_data_->single_axis_avoidance_has_safe_command_ = true;
+    }
+    if (best >= 0) best_traj = accepted_trajectories[best];
+  } else {
+    if (x_motion >= 0) ++avoidance_x_clear_count_;
+    else avoidance_x_clear_count_ = 0;
+    if (avoidance_x_clear_count_ >= avoidance_clear_cycles_) {
+      avoidance_active_ = false;
+      avoidance_returning_to_x_ = true;
+      avoidance_x_clear_count_ = 0;
+      avoidance_axis_blocked_count_ = 0;
+      best = chooseSingleAxisMotionOrBrake(candidates, -1, 1, 0.0);
+      shared_data_->single_axis_avoidance_active_ = true;
+      shared_data_->single_axis_avoidance_has_safe_command_ = true;
+      RCLCPP_INFO(node_->get_logger().get_child(name_),
+        "纯 X 连续 %d 轮恢复安全，先停车再切回 X", avoidance_clear_cycles_);
+    } else {
+      const double locked_cap = avoidance_axis_ == 1 ? y_cap : yaw_cap;
+      const int locked_motion = bestSingleAxisMotion(
+        candidates, avoidance_axis_, avoidance_sign_, locked_cap);
+      if (locked_motion >= 0) {
+        avoidance_axis_blocked_count_ = 0;
+        shared_data_->single_axis_avoidance_has_safe_command_ = true;
+        // During stop confirmation admitted_axis_ is -1, so keep braking even
+        // though the future locked command has already passed collision scoring.
+        best = admitted_axis_ == avoidance_axis_ && admitted_sign_ == avoidance_sign_ ?
+          locked_motion : chooseSingleAxisMotionOrBrake(candidates, -1, 1, 0.0);
+      } else {
+        ++avoidance_axis_blocked_count_;
+        best = chooseSingleAxisMotionOrBrake(candidates, -1, 1, 0.0);
+        if (alternative.index >= 0 &&
+            avoidance_axis_blocked_count_ >= avoidance_switch_cycles_) {
+          avoidance_axis_ = alternative.axis;
+          avoidance_sign_ = alternative.sign;
+          avoidance_axis_blocked_count_ = 0;
+          shared_data_->single_axis_avoidance_has_safe_command_ = true;
+          RCLCPP_WARN(node_->get_logger().get_child(name_),
+            "当前避障轴无安全候选，停车后改锁定 %s%s",
+            avoidance_axis_ == 1 ? "Y" : "Yaw", avoidance_sign_ > 0 ? "+" : "-");
+        } else if (alternative.index >= 0) {
+          shared_data_->single_axis_avoidance_has_safe_command_ = true;
+        }
+      }
+      if (best >= 0) best_traj = accepted_trajectories[best];
+    }
+  }
+
+  // Downstream blockage handling inspects collision-rejected commands. Keep
+  // only commands that this single-axis state could actually execute, so a
+  // colliding mixed-axis visualization candidate cannot request a replan.
+  for (auto& rejected_by_critic : rejected_trajectories) {
+    auto& trajectories = rejected_by_critic.second;
+    trajectories.erase(std::remove_if(trajectories.begin(), trajectories.end(),
+      [this](const base_trajectory::Trajectory& trajectory) {
+        const bool admitted = singleAxisCommandAllowed(
+          trajectory.xv_, trajectory.yv_, trajectory.thetav_,
+          admitted_axis_, admitted_sign_, admitted_speed_cap_);
+        const bool desired_x = (avoidance_active_ || avoidance_returning_to_x_) &&
+          singleAxisCommandAllowed(trajectory.xv_, trajectory.yv_, trajectory.thetav_,
+                                   0, desired_x_sign_, desired_x_speed_cap_);
+        return !admitted && !desired_x;
+      }), trajectories.end());
+  }
 }
 }//end of name space

@@ -50,6 +50,37 @@ int main() {
   assert(turn.front()==.1 && std::abs(turn.back()-.26)<1e-9);
   assert(singleAxisTargets(-.2,.2,NAN,5,1,.2).empty());
 
+  // A complete vx * vy * wz lattice may be scored and visualized, while the
+  // command gate admits only the current axis, direction and speed cap.
+  assert(singleAxisCommandAllowed(0,0,0,-1,1,0));
+  assert(!singleAxisCommandAllowed(.1,0,0,-1,1,.2));
+  assert(singleAxisCommandAllowed(.1,0,0,0,1,.2));
+  assert(!singleAxisCommandAllowed(-.1,0,0,0,1,.2));
+  assert(!singleAxisCommandAllowed(.1,0,.2,0,1,.2));
+  assert(!singleAxisCommandAllowed(.21,0,0,0,1,.2));
+  assert(singleAxisCommandAllowed(0,0,-.2,2,-1,.3));
+  const std::vector<std::array<double,4>> full_candidates{
+    {0,0,0,.01},       // Brake is cheap, but safe admitted motion wins.
+    {.1,0,.2,.001},    // Mixed-axis candidate is diagnostic only.
+    {0,.1,0,.002},     // Wrong axis.
+    {.1,0,0,4.0},      // Admitted motion.
+    {.2,0,0,2.0},      // Lowest-cost admitted motion.
+    {.25,0,0,.5},      // Above the current speed cap.
+    {-.1,0,0,.1},      // Wrong direction.
+  };
+  assert(chooseSingleAxisMotionOrBrake(full_candidates,0,1,.2)==4);
+  assert(chooseSingleAxisMotionOrBrake(full_candidates,-1,1,0)==0);
+  assert(bestSingleAxisMotion(full_candidates,0,1,.2)==4);
+  assert(bestSingleAxisMotion(full_candidates,1,1,.2)==2);
+  assert(bestSingleAxisMotion(full_candidates,2,1,.3)==-1); // Mixed X+yaw is forbidden.
+  auto avoidance = choosePureAvoidanceMotion(full_candidates,.2,.3);
+  assert(avoidance.index==2 && avoidance.axis==1 && avoidance.sign==1);
+  const std::vector<std::array<double,4>> yaw_avoidance{
+    {0,0,0,.001}, {0,0,-.2,.5}, {0,.1,0,.8}, {.1,0,.2,.01}
+  };
+  avoidance = choosePureAvoidanceMotion(yaw_avoidance,.2,.3);
+  assert(avoidance.index==1 && avoidance.axis==2 && avoidance.sign==-1);
+
   SingleAxisTracking timed;
   TrackingErrors te{true,.8,0,1};
   assert(timed.choose(te,{0,0,0},1,true,.52,.26,.3,.15,true)==-1);
@@ -98,6 +129,21 @@ int main() {
   assert(choose(e,{0,0,0})==-1);
   assert(choose(e,{0,0,0})==-1);
   assert(choose(e,{0,0,0})==2 && policy.sign()==-1);
+  // An obstacle-selected pure axis uses the same stop-before-switch gate and
+  // remains locked even when normal path tracking still wants X.
+  SingleAxisTracking forced;
+  TrackingErrors forced_straight{true,0,0,1};
+  assert(forced.choose(forced_straight,{.1,0,0},1,true,.17,.08,.3,.15,
+                       false,1,1)==-1);
+  assert(forced.choose(forced_straight,{0,0,0},2,true,.17,.08,.3,.15,
+                       false,1,1)==-1);
+  assert(forced.choose(forced_straight,{0,0,0},3,true,.17,.08,.3,.15,
+                       false,1,1)==-1);
+  assert(forced.choose(forced_straight,{0,0,0},4,true,.17,.08,.3,.15,
+                       false,1,1)==1 && forced.sign()==1);
+  assert(forced.choose(forced_straight,{0,.1,0},5,true,.17,.08,.3,.15,
+                       false,1,1)==1);
+  assert(forced.choose(forced_straight,{0,.1,0},6,true,.17,.08,.3,.15)==-1);
   // Replay the small future ages observed during straight-line motion.
   using dddmr_sys_core::motionTimestampFresh;
   assert(motionTimestampFresh(1, -.020));

@@ -77,6 +77,11 @@ class TrajectoryGeneratorSharedData{
     double rotation_error_ = 0.0;
     double path_heading_lookahead_ = 0.5;
     double current_allowed_max_linear_speed_;
+    // Set by omni single-axis expert scoring after all collision critics run.
+    // The local planner may keep controlling while a known-safe avoidance
+    // command is being entered, executed, or changed back to X.
+    bool single_axis_avoidance_active_ = false;
+    bool single_axis_avoidance_has_safe_command_ = false;
     geometry_msgs::msg::TwistStamped ref_twist_for_trajectory_generation_;
     
     std::string global_frame_, base_frame_;

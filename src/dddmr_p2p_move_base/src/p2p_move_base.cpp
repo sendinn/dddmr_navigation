@@ -352,12 +352,18 @@ bool P2PMoveBase::setOdomOnly(bool enabled) {
   }
 }
 
+// 一个已接受的导航 Action 对应一次 executeCb，由 handle_accepted 创建的线程执行。
+// 管理整次任务的生命周期：校验目标 -> 选择定位模式 -> 初始化状态/目标 -> 周期决策。
+// executeCycle 负责单轮状态机，本函数负责循环节拍、取消检查、反馈和结束时的清理。
+// 它不是 ROS 定时器回调；无导航任务时不会运行这个控制循环。
 void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandle<dddmr_sys_core::action::PToPMoveBase>> goal_handle)
 {
   auto result = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Result>();
+  // 作用域退出守卫：包括下方提前 return，都会释放任务占用标志，允许后续目标进入。
   auto finish_task = std::shared_ptr<void>(nullptr, [this](void*) { task_running_ = false; });
   auto move_base_goal = goal_handle->get_goal();
 
+  // 目标姿态必须具有有效四元数；失败时停车并报告 Action 中止，不进入控制循环。
   if(!isQuaternionValid(move_base_goal->target_pose.pose.orientation)){
     RCLCPP_WARN(this->get_logger(),"Aborting on goal because it was sent with an invalid quaternion");
     goal_handle->abort(result);
@@ -365,9 +371,13 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
     return;
   }
 
+  // 定位模式按本次任务确定：持续 odom-only 策略优先于 use_mcl_during_navigation。
+  // persistent_odom=true：显式重定位后保持冻结 map->odom，任务结束也不自动恢复匹配。
+  // 否则由 use_mcl_during_navigation 决定任务中持续匹配，还是临时切到纯里程计。
   const bool persistent_odom = get_parameter("relocalization_only").as_bool();
   task_use_mcl_ = !persistent_odom && get_parameter("use_mcl_during_navigation").as_bool();
-  // Restore scan matching on all exits: success, cancellation, rejection, or failure.
+  // 仅“临时纯里程计”模式在作用域退出时停车并请求恢复 MCL；成功、取消、失败均覆盖。
+  // 持续纯里程计和持续 MCL 模式不在此切换；服务失败只记录错误，不代表恢复成功。
   auto restore_mcl = std::shared_ptr<void>(nullptr, [this, odom_only = !task_use_mcl_ && !persistent_odom](void*) {
     if (odom_only) {
       publishZeroVelocity();
@@ -376,6 +386,8 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
     }
   });
   if (!task_use_mcl_) {
+    // 临时纯里程计要求初始定位仍有效；持续纯里程计跳过这里的有效期判断。
+    // 两者均要求 setOdomOnly(true) 服务成功，否则拒绝开始任务。
     const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
     if ((!persistent_odom && (localization_timeout_ <= 0 || now >= localization_valid_until_.load())) || !setOdomOnly(true)) {
@@ -386,10 +398,11 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
     }
     RCLCPP_INFO(get_logger(), "Odometry-only navigation: map-to-odom frozen; MCL policy controls when matching resumes.");
   }
+  // 外层任务循环的目标频率；耗时超过周期时，实际调用频率可能低于配置值。
   rclcpp::Rate r(STATE_->controller_frequency_);
 
-  //@ if we dont initialize oscillation pose here, the first controlling entry will cause recovery behavior.
-  //@ the rclcpp::Time initial are all done in FSM class
+  // 重置本次任务状态、计时及振荡参考位姿，避免沿用上次任务的超时/运动状态。
+  // 有效运动进展看门狗还会在首次 publishVelocity 时重新起计。
   STATE_->initialParams(LP_->getGlobalPose(), clock_->now());
   progress_control_started_ = false;
   last_navigation_action_ = 0;
@@ -398,12 +411,15 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
   localization_paused_ = false;
   localization_replanning_ = false;
   obstacle_replan_.clear();
+  // 保存目标并恢复全局规划管理器；路径是否可用由后续 executeCycle 检查，
+  // resume() 本身不表示已有可执行路径，也不在这里直接发布运动命令。
   STATE_->current_goal_ = move_base_goal->target_pose;
   GPM_->setGoal(STATE_->current_goal_);
   GPM_->resume();
 
   while(rclcpp::ok()){
 
+    // 每轮决策前先检查 Action 生命周期；已失活时取消恢复动作、停车并结束规划。
     if(!goal_handle->is_active()){
       
       if(is_recoverying_.load()){
@@ -417,6 +433,7 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
       return;
     }
 
+    // 客户端请求取消：取消独立恢复 Action，报告 canceled，停车并退出任务线程。
     if(goal_handle->is_canceling()){
 
       if(is_recoverying_.load()){
@@ -431,30 +448,47 @@ void P2PMoveBase::executeCb(const std::shared_ptr<rclcpp_action::ServerGoalHandl
       return;
     }
 
-    //the real work on pursuing a goal is done here
+    // 已接受目标且初始化通过后，每个控制周期推进一次任务状态机。
+    // 非活动/取消目标已在上方处理；false 表示下周期继续，true 表示任务已成功或中止。
+    // 调用频率由上方 rclcpp::Rate(controller_frequency_) 和下方 r.sleep() 控制，
+    // 不是传感器回调，也不是每次全局重规划才调用一次。
     bool done = executeCycle(goal_handle);
     
+    // 将本轮保存的全局位姿和状态转移作为 Action 反馈；不是底盘执行成功的回执。
     auto feedback = std::make_shared<dddmr_sys_core::action::PToPMoveBase::Feedback>();
     feedback->base_position = STATE_->global_pose_;
     feedback->last_decision = STATE_->getLastDecision();
     feedback->current_decision = STATE_->getCurrentDecision();
     goal_handle->publish_feedback(feedback);
 
-    //if we're done, then we'll return from execute
+    // true 只表示任务已结束，成功或中止结果已由 executeCycle 报告；这里不重复报告。
     if(done){
       GPM_->stop();
       return;
     }
     
+    // 等待下一控制周期；等待路径、定位恢复等非运动状态也保持这个循环。
     r.sleep();
 
     //if(STATE_->isCurrentDecision("d_controlling") && r.cycleTime() > ros::Duration(1 / STATE_->controller_frequency_))
     //  ROS_WARN("Control loop missed its desired rate of %.4fHz... the loop actually took %.4f seconds", STATE_->controller_frequency_, r.cycleTime().toSec());
   }
+  // rclcpp::ok() 变为 false（例如 ROS 关闭）时退出循环并停止规划管理器。
   GPM_->stop();
 }
 
+// 执行导航任务的一轮决策，而不是在本函数内一次走完整条路径。
+// 调用链：Action 接受目标 -> handle_accepted() 创建线程 -> executeCb() 循环调用。
+// 前置条件：executeCb 已校验目标、设置定位模式、初始化 STATE_ 并提交目标给 GPM_。
+// 每轮先执行公共安全检查，再按 STATE_ 当前状态执行一个分支；setDecision() 只改变
+// 后续周期的分支，不会立即跳入同一轮的另一个 else-if。等待/恢复期间也会周期调用。
+// 常规流程：initial -> planning -> planning_waitdone -> validate_path -> align_heading
+//           -> [heading_stopping] -> controlling -> align_goal_heading -> 成功。
+// 异常分支可以停车等待、重新规划、进入恢复或中止；并非每轮都会下发运动速度。
+// 返回 true：已通过 goal_handle 报告成功/中止，executeCb 应停止规划管理器并退出。
+// 返回 false：任务尚未结束（包括停车等待），executeCb 发布反馈后等待下一个周期。
 bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHandle<dddmr_sys_core::action::PToPMoveBase>> goal_handle){
+    // 公共门控 1：持续障碍重规划超时则结束任务，不能靠重复请求无限延后截止时间。
     const double obstacle_now = std::chrono::duration<double>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
     if (obstacle_replan_.expired(obstacle_now, STATE_->controller_patience_)) {
@@ -464,6 +498,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       return true;
     }
 
+    // 公共门控 2：仅在本任务使用持续 MCL 时检查定位有效期；失效后保留目标停车，
+    // 待定位稳定且恢复动作结束，再从当前位置重规划。冻结 map->odom 模式不走此门控。
     const auto steady_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     bool localization_invalid = false;
@@ -518,6 +554,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       RCLCPP_INFO(get_logger(), "Localization recovered: replanning retained goal from current pose.");
       return false;
     }
+    // 公共门控 3：规划服务/响应失效与“本次障碍快照无路”不同：前者中止，后者停车重试。
     if (GPM_->planningUnsafe()) {
       publishZeroVelocity();
       recovery_behaviors_client_ptr_->async_cancel_all_goals();
@@ -538,6 +575,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       return false;
     }
 
+    // 同步本轮位姿/里程计；若旋转脉冲仍处于制动或停稳确认阶段，先处理它，
+    // 暂不进入普通状态分支，避免尚未停稳就重新下发下一段运动。
     STATE_->global_pose_ = LP_->getGlobalPose();
     LP_->syncRobotState(robot_state_, ackermann_drive_state_);
     if ((rotation_angle_feedback_ || rotation_predict_duration_ || rotation_pulse_duration_ > 0.0) && rotation_pulse_.active) {
@@ -563,7 +602,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       }
     }
 
-    // Gait-related vertical bobbing is not forward progress on the floor.
+    // 更新无进展/振荡看门狗：水平位移或朝向变化足够大才重置计时。
+    // 四足步态的 Z 向起伏不能当成沿地面的有效进展。
     const double progress_xy = std::hypot(
         STATE_->global_pose_.transform.translation.x - STATE_->oscillation_pose_.transform.translation.x,
         STATE_->global_pose_.transform.translation.y - STATE_->oscillation_pose_.transform.translation.y);
@@ -575,16 +615,20 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
     }
 
 
+    // 初始化状态只切换到规划状态，实际查询留到下一控制周期。
     if(STATE_->isCurrentDecision("d_initial")){
       STATE_->setDecision("d_planning");
     }
 
+    // 请求规划管理器查询路径，然后进入异步结果等待状态；这里不执行局部跟踪。
     else if(STATE_->isCurrentDecision("d_planning")){
       GPM_->queryThread();
       STATE_->setDecision("d_planning_waitdone");
       return false;
     }
 
+    // 检查全局路径结果：至少三个点才交给局部规划器，并进入通行检查。
+    // 普通短路径回到规划重试；定位恢复后的短路径直接中止；规划超时则请求恢复。
     else if(STATE_->isCurrentDecision("d_planning_waitdone")){
       
       //@If global planner keep return empty plan, we will enter this state for n seconds, then abort
@@ -628,6 +672,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       return false;
     }
     
+    // 有全局路径不等于车体可通行：保持零速度，检查路径/感知/TF，
+    // 由障碍重规划门控决定允许对齐、重新查询，还是继续等待。
     else if(STATE_->isCurrentDecision("d_validate_path")) {
       publishZeroVelocity("新路径等待通行检查，保持停车");
       const auto status=LP_->checkPathBeforeAlignment();
@@ -652,6 +698,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       return false;
     }
 
+    // 起步/重规划后的朝向对齐：对准参考路径方向，不是终点姿态。
+    // 未对齐时显式选用 shortest_angle 旋转生成器；对齐后按配置先停稳或直接跟踪。
     else if(STATE_->isCurrentDecision("d_align_heading")){
       // Recheck while aligning too: a newly observed obstruction must not
       // permit repeated turns simply because an earlier snapshot was clear.
@@ -748,6 +796,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 
     }
 
+    // 起步旋转后的制动确认：连续三个不同时间戳的有效低速里程计样本才算停稳。
+    // 停稳后复查方向；仍对齐则跟踪，否则重新对齐。超过五秒未确认则中止。
     else if (STATE_->isCurrentDecision("d_heading_stopping")) {
       publishZeroVelocity();
       const double elapsed = std::chrono::duration<double>(
@@ -777,6 +827,10 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       return false;
     }
 
+    // 终点朝向对齐：由 controlling 的 isGoalReached() 成立，或终点位置控制成功进入。
+    // isGoalReached 比较当前 XY 与完整全局路径末点的距离，并非看状态名就认定到达。
+    // 位置仍达标但朝向未达标时，下方调用 shortest_angle；两者达标且无活动旋转脉冲
+    // 才报告成功。旋转导致位置超差时回到 controlling，重新靠近终点。
     else if(STATE_->isCurrentDecision("d_align_goal_heading")){
       // Turning can move the body outside the position tolerance. Both conditions
       // must hold at completion, rather than latching an earlier position check.
@@ -862,6 +916,9 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       }
     }
 
+    // 常规路径跟踪：先判断终点位置，再更新参考路径并调用配置的主轨迹生成器。
+    // 正常结果经 publishVelocity 下发；障碍触发停车/强制重规划，不受常规查询周期限制。
+    // 感知/TF/配置异常停车等待；裁剪失败回到规划；持续无可用轨迹则请求恢复。
     else if(STATE_->isCurrentDecision("d_controlling")){
 
       //@Check is goal xy tolerance reach
@@ -967,6 +1024,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
 
     }
 
+    // 可选的终点位置控制由独立恢复 Action 执行：这里只轮询结果。
+    // 成功后仍需终点朝向对齐；失败则中止，而不是直接宣布导航完成。
     else if(STATE_->isCurrentDecision("d_recovery_position_control_waitdone")){
       
       if(is_recoverying_){
@@ -991,6 +1050,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       
     }
 
+    // 普通旋转恢复：禁用恢复则直接中止；启用时等待恢复结果，
+    // 在重试次数允许范围内成功后重新规划，失败或次数耗尽则中止。
     else if(STATE_->isCurrentDecision("d_recovery_waitdone")){
       if (!enable_rotate_recovery_) {
         RCLCPP_ERROR(get_logger(), "Rotate recovery disabled: aborting navigation after planner/controller failure.");
@@ -1032,6 +1093,8 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       
     }
 
+    // 等待分支：等待超时则重规划；期间重新评估局部轨迹。
+    // 找到轨迹时只切回 controlling，实际速度在后续跟踪周期发布。
     else if(STATE_->isCurrentDecision("d_waiting")){
       
       //if continue conflict over 10s,to recalculate the path

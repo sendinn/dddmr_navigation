@@ -821,10 +821,20 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
     }
     const bool brake_only=best_traj.cost_<0 ||
       trajectory_generators::zeroCommand(best_traj.xv_,best_traj.yv_,best_traj.thetav_);
-    if (forwardPathBlocked() || (collision_rejected_motion && brake_only)) {
+    const bool reference_path_blocked = forwardPathBlocked();
+    const auto trajectory_state = trajectory_generators_ros_->getSharedDataPtr();
+    const bool safe_single_axis_avoidance =
+      trajectory_state->single_axis_avoidance_active_ &&
+      trajectory_state->single_axis_avoidance_has_safe_command_;
+    if ((reference_path_blocked || (collision_rejected_motion && brake_only)) &&
+        !safe_single_axis_avoidance) {
       RCLCPP_WARN_THROTTLE(get_logger(),*clock_,1000,
         "停车原因：前方路径阻塞或仅剩刹车候选，立即请求新路径");
       return dddmr_sys_core::PATH_BLOCKED_REPLANNING;
+    }
+    if (reference_path_blocked && safe_single_axis_avoidance) {
+      RCLCPP_INFO_THROTTLE(get_logger(),*clock_,1000,
+        "参考路径仍被占据；已有安全单轴避障候选，保持停车切换或执行避障轴");
     }
   }
 
@@ -838,7 +848,19 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   
   // 感知插件还可以给出路径阻塞意见：WAIT 表示保持等待，REPLANNING 表示刷新全局路径。
   std::vector<perception_3d::PerceptionOpinion> opinions = perception_3d_ros_->getStackedPerception()->getOpinions();
+  const auto trajectory_state = trajectory_generators_ros_->getSharedDataPtr();
+  const bool safe_single_axis_avoidance =
+    traj_gen_name == "omni_drive_simple" &&
+    trajectory_state->single_axis_avoidance_active_ &&
+    trajectory_state->single_axis_avoidance_has_safe_command_;
   for(auto opinion_it=opinions.begin(); opinion_it!=opinions.end();opinion_it++){
+    if (safe_single_axis_avoidance &&
+        ((*opinion_it)==perception_3d::PATH_BLOCKED_WAIT ||
+         (*opinion_it)==perception_3d::PATH_BLOCKED_REPLANNING)) {
+      RCLCPP_INFO_THROTTLE(this->get_logger().get_child(name_), *clock_, 1000,
+        "感知报告参考路径阻塞；已有安全单轴避障候选，本轮继续局部避障");
+      continue;
+    }
     if((*opinion_it)==perception_3d::PATH_BLOCKED_WAIT){
       RCLCPP_WARN_THROTTLE(this->get_logger().get_child(name_), *clock_, 5000, "Found the prune plan is blocked, go to wait state.");
       return dddmr_sys_core::PATH_BLOCKED_WAIT;
