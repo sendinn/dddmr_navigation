@@ -624,8 +624,17 @@ void Local_Planner::getBestTrajectory(std::string traj_gen_name, base_trajectory
     marker.lifetime.sec = 1;
     // Rotation has a stationary center: draw the body-front point's swept arc
     // rather than an invisible stack of identical center positions.
-    const bool rotation = std::abs(trajectory.thetav_) > 1e-6 &&
+    bool rotation = std::abs(trajectory.thetav_) > 1e-6 &&
       std::hypot(trajectory.xv_, trajectory.yv_) < 1e-6;
+    // 分阶段候选可能先发 yaw、随后直行。只给中心始终静止的纯旋转画机头弧线，
+    // 其余轨迹显示真实中心线，避免把先转后走误画为整段机头圆弧。
+    if (rotation) {
+      const auto first=trajectory.getPose(0).pose.position;
+      for (unsigned int i=1;i<trajectory.getPosesSize();++i) {
+        const auto point=trajectory.getPose(i).pose.position;
+        if (std::hypot(point.x-first.x,point.y-first.y)>0.005) {rotation=false;break;}
+      }
+    }
     if (rotation) marker.ns += "_rotation";
     for (unsigned int i = 0; i < trajectory.getPosesSize(); ++i) {
       const auto& pose = trajectory.getPose(i).pose;
@@ -685,7 +694,13 @@ dddmr_sys_core::PlannerState Local_Planner::checkPathBeforeAlignment() {
 // 起步/终点对向实例由任务层的 heading_trajectory_generator 指定。
 // 成功时 best_traj 保存选中轨迹及其 vx/vy/wz；返回值说明成功、感知/TF 异常、
 // 路径阻塞、路径裁剪失败或全部候选被拒绝，实际发布 /cmd_vel 由 p2p_move_base 完成。
-dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string traj_gen_name, base_trajectory::Trajectory& best_traj){
+dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string traj_gen_name, base_trajectory::Trajectory& best_traj, bool rotation_test, double test_heading){
+  traj_shared_data_=trajectory_generators_ros_->getSharedDataPtr();
+  rotation_test_diagnostics_.clear();
+  traj_shared_data_->rotation_test_=rotation_test;
+  traj_shared_data_->rotation_test_heading_=test_heading;
+  traj_shared_data_->rotation_test_supported_=false;
+  traj_shared_data_->rotation_test_complete_=false;
   
   // 没有里程计就无法从当前实测速度预测未来运动，也不能安全生成控制指令。
   if(!got_odom_){
@@ -717,7 +732,22 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   // 从完整 global_plan_ 中截取机器人附近的局部参考段 prune_plan_。
   // 前向范围至少覆盖 heading_tracking_distance_，确保方向计算有足够的前视路径；
   // 后向范围保留机器人身后的少量路径，便于最近点和偏差判断。
-  prunePlan(std::max(forward_prune_, heading_tracking_distance_), backward_prune_);
+  if (rotation_test) {
+    // Scoring reference only; no forward-motion target or global replan.
+    prune_plan_.poses.clear(); pcl_prune_plan_.clear();
+    prune_plan_.header=trans_gbl2b_.header;
+    for (int i=0;i<3;++i) {
+      geometry_msgs::msg::PoseStamped p;p.header=prune_plan_.header;
+      p.pose.position.x=trans_gbl2b_.transform.translation.x+0.1*i*std::cos(test_heading);
+      p.pose.position.y=trans_gbl2b_.transform.translation.y+0.1*i*std::sin(test_heading);
+      p.pose.position.z=trans_gbl2b_.transform.translation.z;
+      p.pose.orientation.z=std::sin(test_heading/2);p.pose.orientation.w=std::cos(test_heading/2);
+      prune_plan_.poses.push_back(p);
+    }
+    last_valid_prune_plan_=clock_->now();
+  } else {
+    prunePlan(std::max(forward_prune_, heading_tracking_distance_), backward_prune_);
+  }
 
   // 发布本轮聚合后的障碍点云，仅用于显示和诊断，不参与额外计算。
   sensor_msgs::msg::PointCloud2 ros2_aggregate_onservation;
@@ -762,6 +792,9 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   // 非正常行驶生成器继续使用初始化前的对向误差，避免初始化过程覆盖旋转目标。
   if (traj_gen_name != tracking_trajectory_generator_)
     traj_shared_data_->rotation_error_ = alignment_error;
+
+  if (rotation_test && !traj_shared_data_->rotation_test_supported_)
+    return dddmr_sys_core::CONFIGURATION_ERROR;
 
   // pose_arr 汇总所有候选轨迹的预测位姿，用于可视化；cuboids_pcl 当前未发布。
   geometry_msgs::msg::PoseArray pose_arr;
@@ -815,9 +848,15 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   mpc_critics_ros_->updateSharedData();
   // 逐条评分：被任一硬约束拒绝的轨迹记为无效，其余轨迹中最低代价者写入 best_traj。
   getBestTrajectory(traj_gen_name, best_traj);
+  if(rotation_test) {
+    rotation_test_diagnostics_="generated="+std::to_string(trajectories_->size())+
+      " accepted="+std::to_string(accepted_trajectories_.size());
+    for(const auto& entry:rejected_trajectories_)
+      rotation_test_diagnostics_+=" rejected["+entry.first+"]="+std::to_string(entry.second.size());
+  }
   // 正常行驶时增加提前重规划判断：前方参考路径已经阻塞，或者运动候选均因碰撞
   // 被拒绝而只剩刹车/无有效轨迹时，要求任务状态机立即停车并刷新全局路径。
-  if (traj_gen_name == tracking_trajectory_generator_ && obstacle_replan_lookahead_>0) {
+  if (!rotation_test && traj_gen_name == tracking_trajectory_generator_ && obstacle_replan_lookahead_>0) {
     bool collision_rejected_motion=false;
     for (const auto& entry : rejected_trajectories_) {
       if (entry.first.find("collision")==std::string::npos) continue;
@@ -843,6 +882,15 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
     }
   }
 
+  if (rotation_test && (best_traj.cost_<0 ||
+      trajectory_generators::zeroCommand(best_traj.xv_,best_traj.yv_,best_traj.thetav_))) {
+    for (const auto& entry:rejected_trajectories_)
+      for (const auto& t:entry.second)
+        if (std::abs(t.thetav_)>1e-6) {
+          RCLCPP_WARN(get_logger(), "Rotation test rejected by critic: %s",entry.first.c_str());
+          return dddmr_sys_core::ALL_TRAJECTORIES_FAIL;
+        }
+  }
   auto t_diff = clock_->now() - control_loop_time_;
   RCLCPP_DEBUG(this->get_logger().get_child(name_), "Full control cycle time: %.9f", t_diff.seconds());
 

@@ -83,6 +83,7 @@ ament_target_dependencies(p2p_global_plan_manager
 # p2p_mov2_base
 add_library(p2p_mov2_base SHARED
   src/p2p_move_base.cpp
+  src/rotation_test.cpp
 )
 target_link_libraries(p2p_mov2_base
   p2p_state

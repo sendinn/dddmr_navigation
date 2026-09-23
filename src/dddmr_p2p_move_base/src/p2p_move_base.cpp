@@ -181,6 +181,17 @@ void P2PMoveBase::initial(const std::shared_ptr<local_planner::Local_Planner>& l
     rcl_action_server_get_default_options(),
     action_server_group_);
 
+  // Separate endpoint, same task ownership: test and navigation cannot run together.
+  rotation_test_server_=rclcpp_action::create_server<dddmr_sys_core::action::PToPMoveBase>(
+    this,"/rotation_test",
+    [this](const rclcpp_action::GoalUUID&,std::shared_ptr<const dddmr_sys_core::action::PToPMoveBase::Goal> goal) {
+      if (!std::isfinite(goal->target_value) || std::abs(goal->target_value)<0.0174533 ||
+          std::abs(goal->target_value)>2.96706 || !continuous_path_tracking_ || task_running_.exchange(true))
+        return rclcpp_action::GoalResponse::REJECT;
+      return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    },std::bind(&P2PMoveBase::handle_cancel,this,std::placeholders::_1),
+    [this](auto handle){std::thread([this,handle]{executeRotationTest(handle);}).detach();},
+    rcl_action_server_get_default_options(),action_server_group_);
   RCLCPP_INFO(this->get_logger(), "\033[1;32m---->\033[0m P2P move base launched.");
 
 }

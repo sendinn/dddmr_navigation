@@ -70,7 +70,8 @@ class Local_Planner : public rclcpp::Node {
       ~Local_Planner();
 
       void setPlan(const std::vector<geometry_msgs::msg::PoseStamped>& orig_global_plan);
-      dddmr_sys_core::PlannerState computeVelocityCommand(std::string traj_gen_name, base_trajectory::Trajectory& best_traj);
+      dddmr_sys_core::PlannerState computeVelocityCommand(std::string traj_gen_name, base_trajectory::Trajectory& best_traj, bool rotation_test = false, double test_heading = 0.0);
+      std::string rotation_test_diagnostics_; // Latest generated/accepted/rejected counts.
       dddmr_sys_core::PlannerState checkPathBeforeAlignment();
       void getBestTrajectory(std::string traj_gen_name, base_trajectory::Trajectory& best_traj);
 

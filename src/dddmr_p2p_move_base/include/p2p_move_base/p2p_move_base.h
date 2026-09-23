@@ -85,6 +85,8 @@ class P2PMoveBase : public rclcpp::Node {
 
     rclcpp::Clock::SharedPtr clock_;
     
+    void executeRotationTest(const std::shared_ptr<rclcpp_action::ServerGoalHandle<dddmr_sys_core::action::PToPMoveBase>> handle);
+    rclcpp_action::Server<dddmr_sys_core::action::PToPMoveBase>::SharedPtr rotation_test_server_;
     std::string name_;
     
     std::shared_ptr<tf2_ros::TransformListener> tfl_;

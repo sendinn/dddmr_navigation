@@ -74,6 +74,12 @@ class TrajectoryGeneratorSharedData{
     ackermann_msgs::msg::AckermannDriveStamped ackermann_drive_state_;
     nav_msgs::msg::Path prune_plan_;
     uint64_t rotation_reference_epoch_ = 0;
+    // Explicit rotation-test request; only the turn-then-forward generator supports it.
+    bool rotation_test_ = false;
+    double rotation_test_heading_ = 0.0;
+    bool rotation_test_supported_ = false;
+    bool rotation_test_complete_ = false;
+    int rotation_test_stage_ = 0;
     double rotation_error_ = 0.0;
     double path_heading_lookahead_ = 0.5;
     double current_allowed_max_linear_speed_;

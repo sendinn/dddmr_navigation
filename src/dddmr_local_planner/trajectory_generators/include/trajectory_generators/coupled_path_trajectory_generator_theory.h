@@ -20,11 +20,13 @@ namespace trajectory_generators {
  * 外部 critics 检查后，从通过检查的候选中选择最接近参考指令的一条。
  * single_axis_tracking=true 时，按 yaw、Y、X 优先级选择单轴指令，切换前停稳。
  * 此模式关闭混轴前馈补偿，但仍按耦合模型预测实际位移。
+ * turn_then_forward=true 时改为方向角 × 正 X 速度候选，完整预测转向、停稳、
+ * 直行及制动；锁定候选方向后只执行当前阶段，通过反馈确认后切换阶段。
  * 本类不直接发布 cmd_vel；路径阻塞时仍由上层决定停车或重新规划。
  */
 class CoupledPathTrajectoryGeneratorTheory final : public TrajectoryGeneratorTheory {
  public:
-  size_t getSamplingSize() override { return sample_params_.size(); }
+  size_t getSamplingSize() override { return turn_then_forward_ && !alignment_only_ ? turn_candidates_.size() : sample_params_.size(); }
   /// 每控制周期检查位姿/里程计有效性，并计算、限幅和保存候选指令。
   /// 输入无效时保留空候选集，交由上层处理无法生成轨迹的情况。
   void initialise() override;
@@ -68,6 +70,30 @@ class CoupledPathTrajectoryGeneratorTheory final : public TrajectoryGeneratorThe
   bool generateTrajectory(Eigen::Vector3f command, base_trajectory::Trajectory& trajectory);
   Eigen::Vector3f computeNewPositions(const Eigen::Vector3f& pos,
                                     const Eigen::Vector3f& vel, double dt);
+  // 分阶段候选：转向、停稳、纯 X 直行。只执行已检查轨迹的当前阶段指令。
+  enum class TurnPhase { Brake, Search, Turn, Settle, Drive };
+  struct TurnCandidate { double heading=0, speed=0; bool stop=true; };
+  bool turn_then_forward_ = false;
+  double turn_angle_range_ = 1.5707963268, turn_timeout_ = 15.0;
+  TurnPhase turn_phase_ = TurnPhase::Brake;
+  TurnCandidate turn_locked_;
+  std::vector<TurnCandidate> turn_candidates_;
+  // Critics 只改变 cost/rejected_by；以指令和终点识别本周期已检查的候选，不扩展公共 ABI。
+  using TurnKey = std::array<double,6>;
+  std::map<TurnKey,TurnCandidate> turn_generated_;
+  Point turn_position_{}, turn_segment_start_{}, turn_goal_{};
+  double turn_yaw_=0, turn_desired_heading_=0;
+  int turn_stopped_count_=0, turn_sign_=0;
+  int64_t turn_last_stamp_=0, turn_last_selection_=0, turn_started_=0;
+  uint64_t turn_epoch_=0;
+  void prepareTurnCandidates(const Reference& reference, double x, double y, double yaw);
+  bool generateTurnTrajectory(const TurnCandidate& candidate, base_trajectory::Trajectory& trajectory);
+  void selectTurnTrajectory(const std::vector<base_trajectory::Trajectory>& accepted,
+                            base_trajectory::Trajectory& best);
+  void resetTurnState();
+  double turnRate(double error) const;
+  static TurnKey turnKey(const base_trajectory::Trajectory& trajectory);
+
   /// 路径几何、反馈控制及耦合模型计算，不负责 ROS 指令发布。
   CoupledPathTracker tracker_;
 

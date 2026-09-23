@@ -106,6 +106,13 @@ void CoupledPathTrajectoryGeneratorTheory::onInitialize() {
   c.k_xw=robot_parameter("astrall_coupling_xw");
   tracker_=CoupledPathTracker(c);
   alignment_only_=node_->declare_parameter<bool>(name_+".alignment_only",false);
+  turn_then_forward_=node_->declare_parameter<bool>(name_+".turn_then_forward",false);
+  turn_angle_range_=parameter("turn_angle_range",1.5707963268);
+  turn_timeout_=parameter("turn_timeout",15.0);
+  if (!std::isfinite(turn_angle_range_) || turn_angle_range_<=0 || turn_angle_range_>std::acos(-1.0) ||
+      !std::isfinite(turn_timeout_) || turn_timeout_<1 || turn_timeout_>60 ||
+      (turn_then_forward_ && (!single_axis_tracking_ || alignment_only_)))
+    throw std::invalid_argument("turn_then_forward requires single-axis tracking (not alignment), angle in (0,pi], timeout in [1,60]");
   tracking_diagnostics_=node_->declare_parameter<bool>(name_+".tracking_diagnostics",false);
   axis_yaw_enter_=parameter("axis_yaw_enter",0.1745329252);
   axis_yaw_exit_=parameter("axis_yaw_exit",0.0872664626);
@@ -134,8 +141,9 @@ void CoupledPathTrajectoryGeneratorTheory::onInitialize() {
   for (const auto& p:params_.cuboid)
     if (!std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z))
       throw std::invalid_argument("Non-finite robot cuboid");
-  RCLCPP_INFO(node_->get_logger(), "%s: Astrall continuous %s, coupling_xy=%.4f, coupling_xw=%.4f (requires measured calibration)",
-              name_.c_str(),alignment_only_?"alignment":"tracking",c.k_xy,c.k_xw);
+  RCLCPP_INFO(node_->get_logger(), "%s: Astrall %s %s, coupling_xy=%.4f, coupling_xw=%.4f (requires measured calibration)",
+              name_.c_str(),turn_then_forward_?"turn_then_forward":single_axis_tracking_?"single_axis":"continuous",
+              alignment_only_?"alignment":"tracking",c.k_xy,c.k_xw);
 }
 
 Eigen::Vector3f CoupledPathTrajectoryGeneratorTheory::predictedBodyVelocity(const Eigen::Vector3f& command) const {
@@ -146,6 +154,8 @@ Eigen::Vector3f CoupledPathTrajectoryGeneratorTheory::predictedBodyVelocity(cons
 void CoupledPathTrajectoryGeneratorTheory::initialise() {
   ++diagnostic_cycle_;
   sample_params_.clear();
+  turn_candidates_.clear();
+  turn_generated_.clear();
   reference_command_.setZero();
   cycle_valid_=false;
   axis_errors_=TrackingErrors{};
@@ -177,7 +187,7 @@ void CoupledPathTrajectoryGeneratorTheory::initialise() {
     reference=tracker_.reference(path,p.x,p.y,yaw);
     if (!reference.valid) return;
     desired=reference.desired;
-    if (single_axis_tracking_) {
+    if (single_axis_tracking_ && !turn_then_forward_) {
       // 使用同一前方参考线计算朝向与横向偏差，避免短路径段方向不一致。
       axis_errors_=trackingErrors(path,p.x,p.y,yaw,tracker_.config().lookahead);
       if (!axis_errors_.valid) return;
@@ -229,7 +239,16 @@ void CoupledPathTrajectoryGeneratorTheory::initialise() {
   cycle_stamp_=odom_stamp.nanoseconds();
   cycle_valid_=true;
   reference_command_=Eigen::Vector3f(command[0],command[1],command[2]);
-  sampleVelocityWindow(measured);
+  if (turn_then_forward_ && !alignment_only_) prepareTurnCandidates(reference,p.x,p.y,yaw);
+  else sampleVelocityWindow(measured);
+  if (turn_then_forward_ && !alignment_only_) {
+    if (tracking_diagnostics_) RCLCPP_INFO(node_->get_logger(),
+      "%s tracking_diag cycle=%llu phase=turn_reference stage=%d target=(%.4f,%.4f) "
+      "desired_heading=%.4f robot_yaw=%.4f measured=(%.4f,%.4f,%.4f) candidates=%zu",
+      name_.c_str(),static_cast<unsigned long long>(diagnostic_cycle_),static_cast<int>(turn_phase_),
+      turn_goal_[0],turn_goal_[1],turn_desired_heading_,yaw,measured[0],measured[1],measured[2],getSamplingSize());
+    return;
+  }
   // 此处记录参考指令，实际通过 critics 的选择结果在 expertScoring 中记录。
   if (tracking_diagnostics_) {
     const double yaw_error=alignment_only_?shared_data_->rotation_error_:reference.heading;
@@ -247,7 +266,7 @@ void CoupledPathTrajectoryGeneratorTheory::initialise() {
       reference.lookahead[0],reference.lookahead[1],
       raw_desired[0],raw_desired[1],raw_desired[2],desired[0],desired[1],desired[2],
       command[0],command[1],command[2],measured[0],measured[1],measured[2],
-      (now-odom_stamp).seconds(),(now-pose_stamp).seconds(),sample_params_.size());
+      (now-odom_stamp).seconds(),(now-pose_stamp).seconds(),getSamplingSize());
   }
   RCLCPP_INFO_THROTTLE(node_->get_logger(),*node_->get_clock(),1000,
     "%s: lateral_error=%.3f, yaw_error=%.3f, lookahead=(%.3f,%.3f), desired=(%.3f,%.3f,%.3f), command=(%.3f,%.3f,%.3f)",
@@ -282,8 +301,11 @@ void CoupledPathTrajectoryGeneratorTheory::sampleVelocityWindow(const Velocity& 
   VelocityIterator w(lo[2],hi[2],params_.angular_z_sample);
   for (;!x.isFinished();x++) {
     for (;!y.isFinished();y++) {
-      for (;!w.isFinished();w++)
+      for (;!w.isFinished();w++) {
+        if (alignment_only_ && single_axis_tracking_ &&
+            (std::abs(x.getVelocity())>1e-6 || std::abs(y.getVelocity())>1e-6)) continue;
         sample_params_.emplace_back(x.getVelocity(),y.getVelocity(),w.getVelocity());
+      }
       w.reset();
     }
     y.reset();
@@ -308,6 +330,12 @@ void CoupledPathTrajectoryGeneratorTheory::sampleVelocityWindow(const Velocity& 
 void CoupledPathTrajectoryGeneratorTheory::getSamplingTrajectoryByIndex(size_t index,base_trajectory::Trajectory& trajectory) {
   trajectory.cost_=-1;
   trajectory.resetPoses();
+  if (turn_then_forward_ && !alignment_only_) {
+    if (index>=turn_candidates_.size() || !generateTurnTrajectory(turn_candidates_[index],trajectory)) {
+      trajectory.resetPoses(); trajectory.cost_=-1;
+    } else turn_generated_[turnKey(trajectory)]=turn_candidates_[index];
+    return;
+  }
   if (index>=sample_params_.size() || !generateTrajectory(sample_params_[index],trajectory)) {
     trajectory.resetPoses();
     trajectory.cost_=-1;
@@ -318,6 +346,10 @@ void CoupledPathTrajectoryGeneratorTheory::expertScoring(std::vector<base_trajec
     std::map<std::string,std::vector<base_trajectory::Trajectory>>&,
     base_trajectory::Trajectory& best) {
   best.cost_=-1;
+  if (turn_then_forward_ && !alignment_only_) {
+    selectTurnTrajectory(accepted,best);
+    return;
+  }
   int admitted_axis=-1;
   Eigen::Vector3f selection_reference=reference_command_;
   if (single_axis_tracking_) {

@@ -161,3 +161,40 @@ Astrall 当前两个实例均启用 `single_axis_tracking: true`：朝向偏差�
 的位移，所以纯 yaw/Y 指令并不保证机体完全没有 X 漂移。
 `reference_command` 日志在此模式表示各轴独立目标，实际执行参考见 admission/selection。
 将 `single_axis_tracking` 设为 false 可恢复连续三轴模式。
+
+## 先转向、后直行候选（当前行走配置）
+
+`coupled_path_tracking.turn_then_forward: true` 覆盖本实例的三轴速度网格及
+X/Y/yaw 优先级选择，改成方向角与正 X 速度的组合。`angular_z_sample` 为方向数量，
+`turn_angle_range` 为相对当前机体朝向的采样半范围；另加入当前朝向和前视目标方向。
+只保留面向前视目标半平面的方向。`linear_x_sample` 为正前进速度档数，
+最大值由巡航、轴限速、平移限速和接近目标减速共同决定；Y 采样在此模式不使用。
+
+每个候选预测反应延迟、纯 yaw 转向、停车延迟与制动、纯 X 直线段及最终制动。
+转向漂移来自现有耦合模型，不伪造原地旋转；直行段不含持续 Y/yaw 指令。
+所有阶段的车身包络都经过 critics。按整条轨迹代价、终点到前视点距离及
+方向误差选择，停车只作无有效运动候选或阶段门控时的退路。
+
+实际仅发布所选候选的当前阶段指令：先停稳三个新样本，选择并锁定世界坐标系方向，
+旋转进入 `axis_yaw_exit`，停车并确认三个新样本，再沿 X 直行。行走中不混合转向。
+走完一个前视距离、路径方向变化超过 `axis_yaw_enter` 或机体偏离锁定方向超过
+`axis_yaw_exit` 时先停车重新选择。新任务、参考 epoch 更新、时钟倒退或
+超过 0.5 秒未执行本实例时重新确认停稳。`turn_timeout` 限制单次转向及其预测时间。
+
+诊断 `phase=turn_forward` 的 stage：0 停车、1 方向选择、2 转向、3 停稳、4 直行。
+`selected_valid` 为生成器选择有效性，不是实际执行确认。初始/终点朝向对齐实例
+继续独立工作，在单轴模式仅生成纯 yaw 和停车候选。局部前方路径阻塞检查仍可
+要求停车重规划；新的候选形式不绕过该检查。
+
+### 旋转测试入口
+
+WebUI 的 `/api/rotation-test` 调用任务节点 `/rotation_test` Action（复用
+`PToPMoveBase` 类型，`target_value` 为相对角度弧度）。任务节点与导航互斥，
+将世界坐标目标朝向通过 `rotation_test_ / rotation_test_heading_` 传给主生成器。
+测试复用 `prepareTurnCandidates / generateTurnTrajectory / selectTurnTrajectory`：
+只保留指定朝向及停车，旋转候选速度为零前进速度，预测到旋转制动完成即结束。
+达到容差并确认停稳后设置 `rotation_test_complete_`，不会执行 Drive 的前进指令。
+
+局部规划器为评分建立短参考段，保留感知检查和全部配置 critics；测试不执行前向
+参考路径扫描或全局重规划，因为该任务没有前进段。旋转包络被评分器拒绝时结束测试并
+记录评分器名称，而不是改选另一个转向目标。独立测试不代表正常导航的前向路径已可通行。
