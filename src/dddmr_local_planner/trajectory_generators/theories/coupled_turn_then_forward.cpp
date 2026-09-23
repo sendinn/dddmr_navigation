@@ -11,6 +11,8 @@ void CoupledPathTrajectoryGeneratorTheory::resetTurnState() {
   turn_sign_=0;
   turn_last_stamp_=0;
   turn_started_=0;
+  turn_deviation_count_=0;
+  turn_deviation_odom_stamp_=0;turn_deviation_pose_stamp_=0;
 }
 
 double CoupledPathTrajectoryGeneratorTheory::turnRate(double error) const {
@@ -41,20 +43,38 @@ void CoupledPathTrajectoryGeneratorTheory::prepareTurnCandidates(
       now<turn_last_selection_ || now-turn_last_selection_>500000000 ||
       cycle_stamp_<turn_last_stamp_) resetTurnState();
   turn_epoch_=shared_data_->rotation_reference_epoch_;
-  turn_position_={x,y};turn_yaw_=yaw;turn_goal_=ref.lookahead;
+  turn_yaw_=yaw;turn_goal_=ref.lookahead;
   const double dx=turn_goal_[0]-x,dy=turn_goal_[1]-y;
   turn_desired_heading_=std::hypot(dx,dy)>1e-6?std::atan2(dy,dx):yaw;
   if (shared_data_->rotation_test_) {
     shared_data_->rotation_test_supported_=true;
     turn_desired_heading_=shared_data_->rotation_test_heading_;
   }
-  // 直行期间不边走边转。路线转弯或走完当前短段时，先停车再选择新方向。
-  if (turn_phase_==TurnPhase::Drive &&
-      (std::abs(wrap(turn_desired_heading_-turn_locked_.heading))>axis_yaw_enter_ ||
-       std::abs(wrap(yaw-turn_locked_.heading))>axis_yaw_exit_ ||
-       std::abs(cycle_measured_[2])>0.05 || std::abs(cycle_measured_[1])>0.03 ||
-       std::hypot(x-turn_segment_start_[0],y-turn_segment_start_[1])>=tracker_.config().lookahead))
-    resetTurnState();
+  // 直线持续执行，不再按前视距离强制分段停车。偏差需连续新鲜反馈确认。
+  if (turn_phase_==TurnPhase::Drive) {
+    const double target_error=std::abs(wrap(turn_desired_heading_-turn_locked_.heading));
+    const double body_error=std::abs(wrap(yaw-turn_locked_.heading));
+    const int64_t pose_stamp=rclcpp::Time(shared_data_->robot_pose_.header.stamp).nanoseconds();
+    const bool deviated=target_error>axis_yaw_enter_ || body_error>axis_yaw_exit_;
+    if (!deviated) turn_deviation_count_=0;
+    else if (cycle_stamp_>turn_deviation_odom_stamp_ && pose_stamp>turn_deviation_pose_stamp_)
+      ++turn_deviation_count_;
+    turn_deviation_odom_stamp_=cycle_stamp_;turn_deviation_pose_stamp_=pose_stamp;
+    // 实测非目标轴运动仍立即停车；碰撞筛选每周期照常执行。
+    if (std::abs(cycle_measured_[2])>0.05 || std::abs(cycle_measured_[1])>0.03) {
+      RCLCPP_INFO(node_->get_logger(),"%s drive reset: non-forward motion vy=%.4f wz=%.4f",
+        name_.c_str(),cycle_measured_[1],cycle_measured_[2]);
+      resetTurnState();
+    } else if (turn_deviation_count_>=turn_realign_samples_) {
+      RCLCPP_INFO(node_->get_logger(),"%s drive reset: persistent heading deviation target=%.4f body=%.4f samples=%d",
+        name_.c_str(),target_error,body_error,turn_deviation_count_);
+      resetTurnState();
+    }
+  } else {
+    turn_deviation_count_=0;
+    turn_deviation_odom_stamp_=cycle_stamp_;
+    turn_deviation_pose_stamp_=rclcpp::Time(shared_data_->robot_pose_.header.stamp).nanoseconds();
+  }
   if ((turn_phase_==TurnPhase::Turn || turn_phase_==TurnPhase::Settle) &&
       turn_started_>0 && static_cast<double>(now-turn_started_)*1e-9>turn_timeout_) {
     RCLCPP_WARN(node_->get_logger(),"%s turn_then_forward: turn timeout, brake before replanning direction",name_.c_str());
@@ -228,7 +248,7 @@ void CoupledPathTrajectoryGeneratorTheory::selectTurnTrajectory(
     if(brake && turn_stopped_count_>=3) {
       if(turn_phase_==TurnPhase::Brake)turn_phase_=TurnPhase::Search;
       else if(std::abs(wrap(turn_locked_.heading-turn_yaw_))<=axis_yaw_exit_) {
-        turn_phase_=TurnPhase::Drive;turn_segment_start_=turn_position_;
+        turn_phase_=TurnPhase::Drive;
       } else turn_phase_=TurnPhase::Turn;
       turn_stopped_count_=0;
     }
@@ -238,7 +258,7 @@ void CoupledPathTrajectoryGeneratorTheory::selectTurnTrajectory(
     best=*selected;
     if(std::abs(best.thetav_)>1e-6)turn_sign_=best.thetav_>0?1:-1;
     if(turn_phase_==TurnPhase::Search) {
-      turn_locked_=plan;turn_started_=now;turn_segment_start_=turn_position_;
+      turn_locked_=plan;turn_started_=now;
       turn_phase_=std::abs(best.thetav_)>1e-6?TurnPhase::Turn:TurnPhase::Drive;
     } else if(turn_phase_==TurnPhase::Turn && std::abs(wrap(plan.heading-turn_yaw_))<=axis_yaw_exit_) {
       // 未停稳之前，只能选择已通过检查的停车轨迹，不发送尚未准入的前进指令。

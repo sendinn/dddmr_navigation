@@ -109,6 +109,7 @@ void CoupledPathTrajectoryGeneratorTheory::onInitialize() {
   turn_then_forward_=node_->declare_parameter<bool>(name_+".turn_then_forward",false);
   turn_angle_range_=parameter("turn_angle_range",1.5707963268);
   turn_timeout_=parameter("turn_timeout",15.0);
+  turn_realign_samples_=samples("turn_realign_samples",3.0);
   if (!std::isfinite(turn_angle_range_) || turn_angle_range_<=0 || turn_angle_range_>std::acos(-1.0) ||
       !std::isfinite(turn_timeout_) || turn_timeout_<1 || turn_timeout_>60 ||
       (turn_then_forward_ && (!single_axis_tracking_ || alignment_only_)))

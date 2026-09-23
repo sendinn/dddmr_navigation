@@ -81,9 +81,11 @@ class CoupledPathTrajectoryGeneratorTheory final : public TrajectoryGeneratorThe
   // Critics 只改变 cost/rejected_by；以指令和终点识别本周期已检查的候选，不扩展公共 ABI。
   using TurnKey = std::array<double,6>;
   std::map<TurnKey,TurnCandidate> turn_generated_;
-  Point turn_position_{}, turn_segment_start_{}, turn_goal_{};
+  Point turn_goal_{};
   double turn_yaw_=0, turn_desired_heading_=0;
   int turn_stopped_count_=0, turn_sign_=0;
+  int turn_realign_samples_=3, turn_deviation_count_=0;
+  int64_t turn_deviation_odom_stamp_=0, turn_deviation_pose_stamp_=0;
   int64_t turn_last_stamp_=0, turn_last_selection_=0, turn_started_=0;
   uint64_t turn_epoch_=0;
   void prepareTurnCandidates(const Reference& reference, double x, double y, double yaw);
