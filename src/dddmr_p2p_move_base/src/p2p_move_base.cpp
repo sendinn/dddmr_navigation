@@ -43,6 +43,14 @@ P2PMoveBase::P2PMoveBase(std::string name): Node(name)
     throw std::invalid_argument("Invalid rotation_pulse_duration");
   rotation_predict_duration_ = declare_parameter<bool>("rotation_predict_duration", false);
   rotation_angle_feedback_ = declare_parameter<bool>("rotation_angle_feedback", false);
+  continuous_path_tracking_ = declare_parameter<bool>("continuous_path_tracking", false);
+  heading_trajectory_generator_ = declare_parameter<std::string>(
+    "heading_trajectory_generator", "differential_drive_rotate_shortest_angle");
+  if (heading_trajectory_generator_.empty())
+    throw std::invalid_argument("heading_trajectory_generator cannot be empty");
+  if (continuous_path_tracking_ && (!rotation_angle_feedback_ ||
+      rotation_predict_duration_ || rotation_pulse_duration_ > 0.0))
+    throw std::invalid_argument("Continuous tracking requires angle feedback and disabled fixed/predicted rotation durations");
   rotation_feedback_timeout_ = declare_parameter<double>("rotation_feedback_timeout", 10.0);
   if (!std::isfinite(rotation_feedback_timeout_) || rotation_feedback_timeout_ <= 0)
     throw std::invalid_argument("Invalid rotation_feedback_timeout");
@@ -135,6 +143,9 @@ void P2PMoveBase::initial(const std::shared_ptr<local_planner::Local_Planner>& l
   GPM_ = gpm;
 
   STATE_ = std::make_shared<p2p_move_base::State>(this->get_node_logging_interface(), this->get_node_parameters_interface());
+  if (continuous_path_tracking_ &&
+      LP_->get_parameter("tracking_trajectory_generator").as_string() != STATE_->main_trajectory_generator_)
+    throw std::invalid_argument("Continuous tracking requires local_planner.tracking_trajectory_generator to match main_trajectory_generator");
   
   if(STATE_->use_twist_stamped_){
     stamped_cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("cmd_vel_stamped", 1);
@@ -243,7 +254,10 @@ void P2PMoveBase::publishZeroVelocity(const char* reason, int source_line){
 }
 
 void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
-  if (rotation_angle_feedback_ || rotation_predict_duration_ || rotation_pulse_duration_ > 0.0) {
+  // Continuous tracking may steer while translating. Dedicated initial/final
+  // alignment retains the rotation feedback and settling gates.
+  const bool continuous_tracking = continuous_path_tracking_ && STATE_->isCurrentDecision("d_controlling");
+  if (!continuous_tracking && (rotation_angle_feedback_ || rotation_predict_duration_ || rotation_pulse_duration_ > 0.0)) {
     const bool rotating = std::abs(cmd_traj.thetav_) > 1e-6;
     const int sign = cmd_traj.thetav_ > 0 ? 1 : -1;
     const double now = std::chrono::duration<double>(
@@ -294,7 +308,8 @@ void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
   if(cmd_traj.actuator_type_ == dddmr_sys_core::ActuatorType::MOTOR){
     // Report actual selected commands after the rotation/stop gates. Keep the
     // last moving phase across brief zero commands to avoid pulse-cycle spam.
-    const int action = std::abs(cmd_traj.thetav_) > 1e-6 ? 1 :
+    const bool moving = std::abs(cmd_traj.xv_) > 1e-6 || std::abs(cmd_traj.yv_) > 1e-6 || std::abs(cmd_traj.thetav_) > 1e-6;
+    const int action = continuous_tracking && moving ? 5 : std::abs(cmd_traj.thetav_) > 1e-6 ? 1 :
       std::abs(cmd_traj.yv_) > 1e-6 ? 2 :
       cmd_traj.xv_ > 1e-6 ? 3 : cmd_traj.xv_ < -1e-6 ? 4 : 0;
     if (action == 0) {
@@ -304,7 +319,7 @@ void P2PMoveBase::publishVelocity(const base_trajectory::Trajectory& cmd_traj){
     }
     if (action != 0 && action != last_navigation_action_) {
       last_navigation_action_ = action;
-      const char* label = action == 1 ? "旋转对方向中…" :
+      const char* label = action == 5 ? "连续三轴路径跟踪中…" : action == 1 ? "旋转对方向中…" :
         action == 2 ? "横移回归路线中…" : action == 3 ? "前进中…" : "后退调整中…";
       RCLCPP_INFO(get_logger(), "Navigation action: %s (vx=%.3f m/s, vy=%.3f m/s, wz=%.3f rad/s)",
         label, cmd_traj.xv_, cmd_traj.yv_, cmd_traj.thetav_);
@@ -734,7 +749,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         }
         
         base_trajectory::Trajectory best_traj;
-        dddmr_sys_core::PlannerState PS = LP_->computeVelocityCommand("differential_drive_rotate_shortest_angle", best_traj);
+        dddmr_sys_core::PlannerState PS = LP_->computeVelocityCommand(heading_trajectory_generator_, best_traj);
 
         if(PS == dddmr_sys_core::PlannerState::TRAJECTORY_FOUND){
           STATE_->last_valid_control_ = clock_->now();
@@ -862,7 +877,7 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
         }
         
         base_trajectory::Trajectory best_traj;
-        dddmr_sys_core::PlannerState PS = LP_->computeVelocityCommand("differential_drive_rotate_shortest_angle", best_traj);
+        dddmr_sys_core::PlannerState PS = LP_->computeVelocityCommand(heading_trajectory_generator_, best_traj);
 
         if(PS == dddmr_sys_core::PlannerState::TRAJECTORY_FOUND){
           STATE_->last_valid_control_ = clock_->now();
@@ -924,6 +939,10 @@ bool P2PMoveBase::executeCycle(const std::shared_ptr<rclcpp_action::ServerGoalHa
       //@Check is goal xy tolerance reach
       if(LP_->isGoalReached()){
         publishZeroVelocity();
+        // Continuous steering has no active rotation pulse. Explicitly enter
+        // settling so goal success is checked again after three fresh stopped
+        // samples, even when the final heading is already within tolerance.
+        if (continuous_path_tracking_) rotation_pulse_.stop(steady_now*1e-9);
         if(STATE_->use_position_control_at_goal_){
           RCLCPP_INFO(this->get_logger(), "Goal xy tolerance reach, align the goal with position control.");
           startRecoveryBehaviors("position_control");

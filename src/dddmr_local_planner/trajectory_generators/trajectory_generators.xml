@@ -1,6 +1,10 @@
 <class_libraries>
   <library path="theories">
 
+    <class type="trajectory_generators::CoupledPathTrajectoryGeneratorTheory" base_class_type="trajectory_generators::TrajectoryGeneratorTheory">
+      <description>Continuous three-axis path tracking and alignment with calibrated Y/yaw to X coupling.</description>
+    </class>
+
     <class type="trajectory_generators::DDSimpleTrajectoryGeneratorTheory"  base_class_type="trajectory_generators::TrajectoryGeneratorTheory">
       <description>TBW</description>
     </class>

@@ -164,6 +164,7 @@ class Local_Planner : public rclcpp::Node {
          This should be optimize in future. The variables affect the control behavior.
          The variable should be adapt to vehicle speed!!!
       */
+      std::string tracking_trajectory_generator_;
       double forward_prune_, backward_prune_, heading_tracking_distance_, heading_align_angle_;
 
       /*Timer for robust system design*/

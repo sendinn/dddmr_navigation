@@ -62,6 +62,11 @@ void Local_Planner::initial(
   this->get_parameter("steering_state_topic", steering_state_topic_);
   RCLCPP_INFO(this->get_logger(), "steering_state_topic: %s", steering_state_topic_.c_str());
 
+  tracking_trajectory_generator_ = declare_parameter<std::string>(
+    "tracking_trajectory_generator", "omni_drive_simple");
+  if (tracking_trajectory_generator_.empty())
+    throw std::invalid_argument("tracking_trajectory_generator cannot be empty");
+
   declare_parameter("forward_prune", rclcpp::ParameterValue(1.0));
   this->get_parameter("forward_prune", forward_prune_);
   RCLCPP_INFO(this->get_logger(), "forward_prune: %.2f", forward_prune_);
@@ -676,8 +681,8 @@ dddmr_sys_core::PlannerState Local_Planner::checkPathBeforeAlignment() {
 }
 
 // 根据最新机器人状态、局部参考路径和实时障碍生成候选轨迹，并选出本控制周期的最优轨迹。
-// traj_gen_name 指定本次使用的轨迹生成器，例如正常行驶使用 omni_drive_simple，
-// 起步或终点对向使用 differential_drive_rotate_shortest_angle。
+// traj_gen_name 是配置实例名；跟踪实例由 tracking_trajectory_generator 指定，
+// 起步/终点对向实例由任务层的 heading_trajectory_generator 指定。
 // 成功时 best_traj 保存选中轨迹及其 vx/vy/wz；返回值说明成功、感知/TF 异常、
 // 路径阻塞、路径裁剪失败或全部候选被拒绝，实际发布 /cmd_vel 由 p2p_move_base 完成。
 dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string traj_gen_name, base_trajectory::Trajectory& best_traj){
@@ -755,7 +760,7 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   const double alignment_error = traj_shared_data_->rotation_error_;
   trajectory_generators_ros_->initializeTheories_wi_Shared_data();
   // 非正常行驶生成器继续使用初始化前的对向误差，避免初始化过程覆盖旋转目标。
-  if (traj_gen_name != "omni_drive_simple")
+  if (traj_gen_name != tracking_trajectory_generator_)
     traj_shared_data_->rotation_error_ = alignment_error;
 
   // pose_arr 汇总所有候选轨迹的预测位姿，用于可视化；cuboids_pcl 当前未发布。
@@ -812,7 +817,7 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   getBestTrajectory(traj_gen_name, best_traj);
   // 正常行驶时增加提前重规划判断：前方参考路径已经阻塞，或者运动候选均因碰撞
   // 被拒绝而只剩刹车/无有效轨迹时，要求任务状态机立即停车并刷新全局路径。
-  if (traj_gen_name == "omni_drive_simple" && obstacle_replan_lookahead_>0) {
+  if (traj_gen_name == tracking_trajectory_generator_ && obstacle_replan_lookahead_>0) {
     bool collision_rejected_motion=false;
     for (const auto& entry : rejected_trajectories_) {
       if (entry.first.find("collision")==std::string::npos) continue;
@@ -850,7 +855,7 @@ dddmr_sys_core::PlannerState Local_Planner::computeVelocityCommand(std::string t
   std::vector<perception_3d::PerceptionOpinion> opinions = perception_3d_ros_->getStackedPerception()->getOpinions();
   const auto trajectory_state = trajectory_generators_ros_->getSharedDataPtr();
   const bool safe_single_axis_avoidance =
-    traj_gen_name == "omni_drive_simple" &&
+    traj_gen_name == tracking_trajectory_generator_ &&
     trajectory_state->single_axis_avoidance_active_ &&
     trajectory_state->single_axis_avoidance_has_safe_command_;
   for(auto opinion_it=opinions.begin(); opinion_it!=opinions.end();opinion_it++){

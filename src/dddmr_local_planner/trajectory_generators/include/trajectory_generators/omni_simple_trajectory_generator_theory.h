@@ -56,6 +56,11 @@ class OmniSimpleTrajectoryGeneratorTheory: public TrajectoryGeneratorTheory{
     void initialise();
     bool isMotorConstraintSatisfied(Eigen::Vector3f& vel_samp);
 
+  protected:
+    // Commands and achieved body velocities can differ on coupled platforms.
+    virtual Eigen::Vector3f predictedBodyVelocity(const Eigen::Vector3f& command) const {
+      return command;
+    }
     bool generateTrajectory(
         Eigen::Vector3f sample_target_vel,
         base_trajectory::Trajectory& traj);

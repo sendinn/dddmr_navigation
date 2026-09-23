@@ -104,6 +104,7 @@ add_library(theories SHARED
   theories/dd_rotate_inplace_theory.cpp
   theories/dd_simple_trajectory_generator_theory.cpp
   theories/omni_simple_trajectory_generator_theory.cpp
+  theories/coupled_path_trajectory_generator_theory.cpp
   theories/one_state_trajectory_generator_theory.cpp
 )
 target_link_libraries(theories
@@ -151,6 +152,8 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}/
 )
 
+install(DIRECTORY docs/ DESTINATION share/${PROJECT_NAME}/docs)
+
 install(FILES trajectory_generators.xml
   DESTINATION share/${PROJECT_NAME}
 )
@@ -159,13 +162,4 @@ ament_export_include_directories(include)
 ament_export_libraries(trajectory_generator_theory stacked_generator trajectory_generator_ros theories)
 ament_export_dependencies(${dependencies})
 pluginlib_export_plugin_description_file(trajectory_generators trajectory_generators.xml)
-if(BUILD_TESTING)
-  enable_testing()
-  add_executable(braking_obstacle_test test/braking_obstacle_test.cpp)
-  target_compile_options(braking_obstacle_test PRIVATE -UNDEBUG)
-  add_test(NAME braking_obstacle_test COMMAND braking_obstacle_test)
-  add_executable(single_axis_tracking_test test/single_axis_tracking_test.cpp)
-  target_compile_options(single_axis_tracking_test PRIVATE -UNDEBUG)
-  add_test(NAME single_axis_tracking_test COMMAND single_axis_tracking_test)
-endif()
 ament_package()

@@ -143,8 +143,9 @@ void OmniSimpleTrajectoryGeneratorTheory::onInitialize(){
   node_->get_parameter(name_ + ".deceleration_ratio", limits_->deceleration_ratio);
   RCLCPP_INFO(node_->get_logger().get_child(name_), "deceleration_ratio: %.2f", limits_->deceleration_ratio);
 
-  if(limits_->min_vel_x<0)
-    RCLCPP_FATAL(node_->get_logger().get_child(name_), "The min velocity of the robot should be positive!");
+  if (!std::isfinite(limits_->min_vel_x) || !std::isfinite(limits_->max_vel_x) ||
+      limits_->min_vel_x > limits_->max_vel_x)
+    throw std::invalid_argument("Invalid X velocity bounds");
 
   /*Motor constraint*/
   node_->declare_parameter(name_ + ".use_motor_constraint", rclcpp::ParameterValue(false));
@@ -520,6 +521,8 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
   traj.resetPoses();
   const auto& measured = shared_data_->robot_state_.twist.twist;
   Eigen::Vector3f initial_velocity(measured.linear.x, measured.linear.y, measured.angular.z);
+  const Eigen::Vector3f predicted_target = predictedBodyVelocity(sample_target_vel);
+  if (!predicted_target.allFinite()) return false;
   if (!sample_target_vel.allFinite() || !initial_velocity.allFinite() ||
       sample_target_vel[0] < limits_->min_vel_x - eps ||
       sample_target_vel[0] > limits_->max_vel_x + eps ||
@@ -560,9 +563,9 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
   //compute the number of steps we must take along this trajectory to be "safe"
   // Bound both current and target speeds, including mixed-axis transients.
   double sim_time_distance = std::hypot(
-      std::max(std::abs(initial_velocity[0]), std::abs(sample_target_vel[0])),
-      std::max(std::abs(initial_velocity[1]), std::abs(sample_target_vel[1]))) * params_->sim_time;
-  double sim_time_angle = std::max(std::abs(initial_velocity[2]), std::abs(sample_target_vel[2])) * params_->sim_time;
+      std::max(std::abs(initial_velocity[0]), std::abs(predicted_target[0])),
+      std::max(std::abs(initial_velocity[1]), std::abs(predicted_target[1]))) * params_->sim_time;
+  double sim_time_angle = std::max(std::abs(initial_velocity[2]), std::abs(predicted_target[2])) * params_->sim_time;
   num_steps =
       ceil(std::max(sim_time_distance / params_->sim_granularity,
           sim_time_angle / params_->angular_sim_granularity));
@@ -584,7 +587,7 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
     double stopping_time = 0;
     for (int axis=0; axis<3; ++axis)
       stopping_time = std::max(stopping_time,
-        static_cast<double>(std::max(std::abs(initial_velocity[axis]), std::abs(sample_target_vel[axis])) /
+        static_cast<double>(std::max(std::abs(initial_velocity[axis]), std::abs(predicted_target[axis])) /
         (acceleration[axis] * limits_->deceleration_ratio)));
     num_steps += reaction_steps + static_cast<int>(std::ceil(stopping_time / dt));
   }
@@ -617,7 +620,7 @@ bool OmniSimpleTrajectoryGeneratorTheory::generateTrajectory(
         if (step < reaction_steps) {
           average_velocity[axis]=velocity;
         } else {
-          const double target = step < reaction_steps+command_steps ? sample_target_vel[axis] : 0.0;
+          const double target = step < reaction_steps+command_steps ? predicted_target[axis] : 0.0;
           average_velocity[axis]=integrateVelocity(velocity, target, acceleration[axis],
                                                   limits_->deceleration_ratio, dt)/dt;
           loop_vel[axis]=velocity;
